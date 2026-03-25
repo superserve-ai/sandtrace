@@ -38,7 +38,7 @@ pub enum ValidationError {
     InvalidVerdictResult(String),
 }
 
-const VALID_EVENT_TYPES: &[&str] = &["network_egress", "policy_violation", "filesystem_summary"];
+const VALID_EVENT_TYPES: &[&str] = &["network_egress", "policy_violation", "filesystem_summary", "syscall_activity"];
 const VALID_VERDICT_RESULTS: &[&str] = &["allow", "deny", "anomaly"];
 
 /// Validate an AuditEvent against schema/event.json constraints.

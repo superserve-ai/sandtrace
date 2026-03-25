@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": { "type": "string", "const": "1.0" },
     "event_id": { "type": "string" },
-    "event_type": { "type": "string", "enum": ["network_egress", "policy_violation", "filesystem_summary"] },
+    "event_type": { "type": "string", "enum": ["network_egress", "policy_violation", "filesystem_summary", "syscall_activity"] },
     "agent_id": { "type": "string" },
     "trace_id": { "type": "string" },
     "seq": { "type": "integer", "minimum": 1 },
