@@ -159,7 +159,19 @@ fn walk_overlay_dir(
 
     for entry in entries {
         let entry = entry?;
-        let metadata = entry.metadata()?;
+        // Use symlink_metadata (lstat) to avoid following symlinks.
+        // A malicious agent could plant symlinks pointing to sensitive host
+        // files; following them would leak metadata or content.
+        let metadata = fs::symlink_metadata(entry.path())?;
+
+        if metadata.file_type().is_symlink() {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping symlink in overlay upper dir (potential host escape)"
+            );
+            continue;
+        }
+
         let rel = entry.path()
             .strip_prefix(root)
             .unwrap_or(entry.path().as_path())
@@ -292,7 +304,10 @@ fn walk_tree_inner(
 
     for entry in entries {
         let entry = entry?;
-        let metadata = match entry.metadata() {
+        // Use symlink_metadata (lstat) to avoid following symlinks.
+        // A malicious agent could plant symlinks pointing to sensitive host
+        // files; following them would leak metadata or content.
+        let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 tracing::warn!(path = %entry.path().display(), "permission denied, skipping");
@@ -300,6 +315,14 @@ fn walk_tree_inner(
             }
             Err(e) => return Err(e.into()),
         };
+
+        if metadata.file_type().is_symlink() {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping symlink in snapshot tree (potential host escape)"
+            );
+            continue;
+        }
 
         let rel = entry.path()
             .strip_prefix(root)
@@ -472,6 +495,38 @@ mod tests {
         let summary: FsSummary = serde_json::from_value(events[0].payload.clone()).unwrap();
         assert_eq!(summary.files_created, vec!["/file.txt"]);
         assert_eq!(summary.total_bytes_written, 4);
+    }
+
+    #[test]
+    fn test_snapshot_diff_skips_symlinks() {
+        let before = tempfile::tempdir().unwrap();
+        let after = tempfile::tempdir().unwrap();
+
+        // Create a regular file and a symlink in "after"
+        fs::write(after.path().join("real.txt"), "real").unwrap();
+        std::os::unix::fs::symlink("/etc/shadow", after.path().join("evil_link")).unwrap();
+
+        let summary = diff_snapshots(before.path(), after.path()).unwrap();
+        // Only the real file should appear, symlink must be skipped
+        assert_eq!(summary.files_created, vec!["/real.txt"]);
+        assert!(!summary.files_created.contains(&"/evil_link".to_string()));
+        assert!(summary.files_modified.is_empty());
+        assert!(summary.files_deleted.is_empty());
+    }
+
+    #[test]
+    fn test_overlay_scan_skips_symlinks() {
+        let upper = tempfile::tempdir().unwrap();
+
+        // Regular file + symlink in upper dir
+        fs::write(upper.path().join("legit.txt"), "ok").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", upper.path().join("sneaky")).unwrap();
+
+        let summary = scan_overlay_upper(upper.path()).unwrap();
+        // Only legit.txt should appear
+        assert_eq!(summary.files_modified.len(), 1);
+        assert!(summary.files_modified.contains(&"/legit.txt".to_string()));
+        assert!(!summary.files_modified.contains(&"/sneaky".to_string()));
     }
 
     #[test]
