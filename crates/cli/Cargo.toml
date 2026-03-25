@@ -1,0 +1,22 @@
+[package]
+name = "sandtrace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sandtrace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+sandtrace-capture = { path = "../capture" }
+sandtrace-policy = { path = "../policy" }
+sandtrace-audit-chain = { path = "../audit-chain" }
+sandtrace-provider = { path = "../provider" }
