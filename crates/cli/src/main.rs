@@ -40,6 +40,10 @@ enum Command {
         /// Policy file to check against (overrides --policy)
         #[arg(long)]
         against: Option<String>,
+
+        /// Output results as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run the demo scenario showing exfiltration detection
@@ -76,12 +80,12 @@ fn main() -> Result<()> {
             sandbox_id,
             output,
         } => cmd_watch(sandbox_id, output, policy),
-        Command::Verify { path, against } => {
+        Command::Verify { path, against, json } => {
             let verify_policy = match against {
                 Some(ref p) => Some(sandtrace_policy::load_policy_file(p)?),
                 None => policy,
             };
-            cmd_verify(path, verify_policy)
+            cmd_verify(path, verify_policy, json)
         }
         Command::Demo { scenario } => cmd_demo(scenario),
     }
@@ -109,38 +113,75 @@ fn cmd_watch(
 fn cmd_verify(
     path: String,
     policy: Option<sandtrace_policy::PolicyManifest>,
+    json_output: bool,
 ) -> Result<()> {
     tracing::info!(path, "verifying audit trail");
 
     let events = sandtrace_audit_chain::read_jsonl(&path)?;
     let chain_result = sandtrace_audit_chain::verify_chain(&events)?;
 
-    if chain_result.valid {
-        tracing::info!(
-            events = chain_result.event_count,
-            "chain integrity verified"
-        );
-    } else {
-        tracing::error!(
-            broken_at = chain_result.broken_at_seq,
-            "chain integrity BROKEN"
-        );
-    }
+    let violations = policy
+        .as_ref()
+        .map(|p| sandtrace_policy::check_events(&events, p))
+        .unwrap_or_default();
 
-    if let Some(policy) = &policy {
-        let violations = sandtrace_policy::check_events(&events, policy);
-        if violations.is_empty() {
-            tracing::info!("no policy violations found");
+    if json_output {
+        let output = serde_json::json!({
+            "path": path,
+            "chain": {
+                "valid": chain_result.valid,
+                "event_count": chain_result.event_count,
+                "errors": chain_result.errors,
+            },
+            "policy": {
+                "checked": policy.is_some(),
+                "violations": violations.iter().map(|v| serde_json::json!({
+                    "event_id": v.event_id,
+                    "rule_id": v.rule_id,
+                    "reason": v.reason,
+                })).collect::<Vec<_>>(),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        // Human-readable output
+        if chain_result.valid {
+            println!(
+                "Chain integrity: VALID ({} events)",
+                chain_result.event_count
+            );
         } else {
-            for v in &violations {
-                tracing::warn!(
-                    event_id = %v.event_id,
-                    rule = %v.rule_id,
-                    reason = %v.reason,
-                    "policy violation"
+            println!(
+                "Chain integrity: BROKEN ({} events, {} errors)",
+                chain_result.event_count,
+                chain_result.errors.len()
+            );
+            for err in &chain_result.errors {
+                println!(
+                    "  seq {}: {} — {}",
+                    err.seq, err.kind, err.detail
                 );
             }
         }
+
+        if policy.is_some() {
+            if violations.is_empty() {
+                println!("Policy compliance: PASS");
+            } else {
+                println!("Policy compliance: {} violations", violations.len());
+                for v in &violations {
+                    println!(
+                        "  event {}: [{}] {}",
+                        v.event_id, v.rule_id, v.reason
+                    );
+                }
+            }
+        }
+    }
+
+    // Exit with non-zero status if chain is broken or policy violated
+    if !chain_result.valid || !violations.is_empty() {
+        std::process::exit(1);
     }
 
     Ok(())
