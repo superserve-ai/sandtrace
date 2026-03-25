@@ -24,6 +24,7 @@ pub struct CapturedEvent {
 pub enum EventType {
     NetworkEgress,
     FilesystemSummary,
+    SyscallActivity,
     PolicyViolation,
 }
 
