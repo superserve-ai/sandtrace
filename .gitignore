@@ -7,3 +7,9 @@ state.json
 target/
 Cargo.lock
 .beads/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
