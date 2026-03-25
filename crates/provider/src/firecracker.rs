@@ -77,6 +77,77 @@ impl SandboxProvider for FirecrackerProvider {
         Ok(Box::new(events.into_iter()))
     }
 
+    fn attach_streaming(
+        &self,
+        sandbox_id: &str,
+        tx: std::sync::mpsc::Sender<CapturedEvent>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = sandbox_id.to_string();
+
+        tracing::info!(sandbox_id, "starting continuous capture");
+
+        // Spawn network capture thread.
+        let net_tx = tx.clone();
+        let net_shutdown = shutdown.clone();
+        let tap_device = self.tap_device.clone();
+        let net_agent_id = agent_id.clone();
+        let net_trace_id = trace_id.clone();
+
+        let net_handle = std::thread::Builder::new()
+            .name("sandtrace-net".to_string())
+            .spawn(move || {
+                let config = NetworkCaptureConfig {
+                    tap_device,
+                    agent_id: net_agent_id,
+                    trace_id: net_trace_id,
+                    ..Default::default()
+                };
+                if let Err(e) = sandtrace_capture::network::capture_egress_streaming(
+                    &config,
+                    net_tx,
+                    net_shutdown,
+                    std::time::Duration::from_secs(2),
+                ) {
+                    tracing::warn!(error = %e, "network capture stopped");
+                }
+            })?;
+
+        // Spawn filesystem watcher thread.
+        let fs_tx = tx.clone();
+        let fs_shutdown = shutdown.clone();
+        let overlay_upper_dir = self.overlay_upper_dir.clone();
+        let fs_agent_id = agent_id.clone();
+        let fs_trace_id = trace_id.clone();
+
+        let fs_handle = std::thread::Builder::new()
+            .name("sandtrace-fs".to_string())
+            .spawn(move || {
+                let config = FsTrackingConfig {
+                    agent_id: fs_agent_id,
+                    trace_id: fs_trace_id,
+                    method: FsTrackingMethod::OverlayUpperDir {
+                        upper_dir: std::path::PathBuf::from(overlay_upper_dir),
+                    },
+                };
+                if let Err(e) = sandtrace_capture::filesystem::watch_fs_changes(
+                    &config,
+                    fs_tx,
+                    fs_shutdown,
+                    std::time::Duration::from_secs(3),
+                ) {
+                    tracing::warn!(error = %e, "filesystem watch stopped");
+                }
+            })?;
+
+        // Wait for both capture threads to finish.
+        let _ = net_handle.join();
+        let _ = fs_handle.join();
+
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "firecracker"
     }

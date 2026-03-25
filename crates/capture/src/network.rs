@@ -84,6 +84,62 @@ pub fn capture_egress(config: &NetworkCaptureConfig) -> Result<Vec<CapturedEvent
     Ok(tracker.drain_events(&config.agent_id, &config.trace_id))
 }
 
+/// Continuously captures network egress and sends events through a channel.
+///
+/// Runs until `shutdown` is set to true or the channel is closed.
+/// Flushes accumulated connection stats every `flush_interval`.
+pub fn capture_egress_streaming(
+    config: &NetworkCaptureConfig,
+    tx: std::sync::mpsc::Sender<CapturedEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    flush_interval: Duration,
+) -> Result<()> {
+    let mut sniffer = TapSniffer::open(&config.tap_device)?;
+    sniffer.set_timeout(config.read_timeout)?;
+
+    let mut tracker = ConnectionTracker::new();
+    let mut last_flush = Instant::now();
+
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        match sniffer.read_frame()? {
+            Some(frame) => {
+                if let Some(pkt) = packet::parse_frame(frame, config.vm_mac.as_ref()) {
+                    tracker.record_packet(&pkt);
+                }
+            }
+            None => {
+                // Read timeout — no traffic, continue waiting
+            }
+        }
+
+        // Periodically flush accumulated connections as events.
+        if last_flush.elapsed() >= flush_interval && tracker.connection_count() > 0 {
+            let events = tracker.drain_events(&config.agent_id, &config.trace_id);
+            for event in events {
+                if tx.send(event).is_err() {
+                    // Receiver dropped — stop capturing
+                    return Ok(());
+                }
+            }
+            last_flush = Instant::now();
+        }
+    }
+
+    // Final flush on shutdown.
+    if tracker.connection_count() > 0 {
+        let events = tracker.drain_events(&config.agent_id, &config.trace_id);
+        for event in events {
+            let _ = tx.send(event);
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a network egress event payload into structured fields.
 pub fn parse_egress_payload(event: &CapturedEvent) -> Option<EgressInfo> {
     if event.event_type != EventType::NetworkEgress {

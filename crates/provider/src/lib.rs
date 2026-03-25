@@ -24,9 +24,30 @@ use anyhow::Result;
 use sandtrace_capture::CapturedEvent;
 
 /// Trait for sandbox provider adapters.
-pub trait SandboxProvider {
-    /// Attach to a running sandbox and return a stream of events.
+pub trait SandboxProvider: Send {
+    /// Attach to a running sandbox and return a snapshot of events.
     fn attach(&self, sandbox_id: &str) -> Result<Box<dyn Iterator<Item = CapturedEvent>>>;
+
+    /// Attach to a running sandbox and stream events continuously through a channel.
+    /// Runs until the shutdown flag is set.
+    fn attach_streaming(
+        &self,
+        sandbox_id: &str,
+        tx: std::sync::mpsc::Sender<CapturedEvent>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        // Default: fall back to point-in-time capture
+        let events = self.attach(sandbox_id)?;
+        for event in events {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Provider name for logging and identification.
     fn name(&self) -> &str;

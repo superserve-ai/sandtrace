@@ -114,6 +114,59 @@ pub fn capture_fs_changes(config: &FsTrackingConfig) -> Result<Vec<CapturedEvent
     Ok(vec![summary.to_event(&config.agent_id, &config.trace_id)])
 }
 
+/// Continuously watches filesystem changes and sends events through a channel.
+///
+/// Polls the filesystem on `poll_interval`, compares against the previous state,
+/// and emits events only when new changes are detected.
+pub fn watch_fs_changes(
+    config: &FsTrackingConfig,
+    tx: std::sync::mpsc::Sender<CapturedEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    poll_interval: std::time::Duration,
+) -> Result<()> {
+    let mut prev_summary: Option<FsSummary> = None;
+
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        let current = match &config.method {
+            FsTrackingMethod::OverlayUpperDir { upper_dir } => {
+                scan_overlay_upper(upper_dir).ok()
+            }
+            FsTrackingMethod::SnapshotDiff { before, after } => {
+                diff_snapshots(before, after).ok()
+            }
+        };
+
+        if let Some(summary) = current {
+            let is_new = match &prev_summary {
+                None => !summary.files_created.is_empty()
+                    || !summary.files_modified.is_empty()
+                    || !summary.files_deleted.is_empty(),
+                Some(prev) => {
+                    summary.files_created != prev.files_created
+                        || summary.files_modified != prev.files_modified
+                        || summary.files_deleted != prev.files_deleted
+                }
+            };
+
+            if is_new {
+                let event = summary.to_event(&config.agent_id, &config.trace_id);
+                if tx.send(event).is_err() {
+                    return Ok(());
+                }
+                prev_summary = Some(summary);
+            }
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // OverlayFS upper-dir scanning
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 mod demo;
+mod pretty;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -220,9 +221,8 @@ async fn cmd_watch(
 
     // Auto-detect the sandbox provider and attach.
     let provider = sandtrace_provider::detect::create_default_provider();
-    tracing::info!(provider = provider.name(), "detected provider");
-
-    let captured_events = provider.attach(&sandbox_id)?;
+    let provider_name = provider.name().to_string();
+    tracing::info!(provider = %provider_name, "detected provider");
 
     // Convert captured events into hash-chained audit events, evaluate
     // policy on each, and emit through the output pipeline.
@@ -254,54 +254,82 @@ async fn cmd_watch(
         });
     }
 
-    for captured in captured_events {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("shutdown signal received, flushing");
-            break;
+    // Start continuous streaming capture in a background thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stream_shutdown = shutdown.clone();
+    let stream_sandbox_id = sandbox_id.clone();
+
+    let capture_handle = std::thread::Builder::new()
+        .name("sandtrace-capture".to_string())
+        .spawn(move || {
+            if let Err(e) = provider.attach_streaming(&stream_sandbox_id, tx, stream_shutdown) {
+                tracing::error!(error = %e, "capture failed");
+            }
+        })?;
+
+    let policy_rules = policy.as_ref().map(|p| p.rules.len()).unwrap_or(0);
+    pretty::print_banner(&sandbox_id, &provider_name, policy_rules, &output);
+
+    let mut stats = pretty::WatchStats::default();
+
+    // Process events as they arrive from the capture threads.
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(captured) => {
+                let event_type_str = event_type_to_str(&captured.event_type);
+                let evidence_tier = evidence_tier_for(&captured.event_type);
+
+                let verdict = policy.as_ref().map(|p| {
+                    let tmp = sandtrace_audit_chain::build_event(
+                        event_type_str,
+                        &captured.agent_id,
+                        &captured.trace_id,
+                        seq,
+                        prev_hash.clone(),
+                        evidence_tier,
+                        captured.payload.clone(),
+                        None,
+                    );
+                    sandtrace_policy::evaluate(&tmp, p)
+                });
+
+                let audit_event = sandtrace_audit_chain::build_event(
+                    event_type_str,
+                    &captured.agent_id,
+                    &captured.trace_id,
+                    seq,
+                    prev_hash.clone(),
+                    evidence_tier,
+                    captured.payload,
+                    verdict,
+                );
+
+                prev_hash = Some(audit_event.record_hash.clone());
+                seq += 1;
+
+                pretty::print_event(&audit_event);
+                stats.record(&audit_event);
+                stream.emit(&audit_event).await?;
+                event_count += 1;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("shutdown signal received, flushing");
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::info!("capture channels closed");
+                break;
+            }
         }
-
-        let event_type_str = event_type_to_str(&captured.event_type);
-        let evidence_tier = evidence_tier_for(&captured.event_type);
-
-        // Evaluate policy if available. We build a preliminary event without
-        // a verdict so policy can inspect it, then build the final event with
-        // the verdict included in the hash.
-        let verdict = policy.as_ref().map(|p| {
-            let tmp = sandtrace_audit_chain::build_event(
-                event_type_str,
-                &captured.agent_id,
-                &captured.trace_id,
-                seq,
-                prev_hash.clone(),
-                evidence_tier,
-                captured.payload.clone(),
-                None,
-            );
-            sandtrace_policy::evaluate(&tmp, p)
-        });
-
-        let audit_event = sandtrace_audit_chain::build_event(
-            event_type_str,
-            &captured.agent_id,
-            &captured.trace_id,
-            seq,
-            prev_hash.clone(),
-            evidence_tier,
-            captured.payload,
-            verdict,
-        );
-
-        prev_hash = Some(audit_event.record_hash.clone());
-        seq += 1;
-
-        stream.emit(&audit_event).await?;
-        event_count += 1;
     }
 
+    let _ = capture_handle.join();
     stream.flush().await?;
     stream.close().await?;
 
-    tracing::info!(event_count, "watch complete");
+    pretty::print_summary(&stats, &output);
     Ok(())
 }
 
