@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use sandtrace_capture::CapturedEvent;
 use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, capture_fs_changes};
+use sandtrace_capture::network::{NetworkCaptureConfig, capture_egress};
+use sandtrace_capture::syscall::{SyscallMonitorConfig, capture_syscalls};
 
 use crate::SandboxProvider;
 
@@ -33,6 +35,9 @@ pub struct BlaxelProvider {
     pub before_checkpoint: Option<String>,
     /// Label for the "after" checkpoint. Defaults to "latest".
     pub after_checkpoint: Option<String>,
+    /// PID of the Firecracker jailer process for syscall monitoring.
+    /// If `None`, syscall capture is skipped.
+    pub jailer_pid: Option<u32>,
 }
 
 impl Default for BlaxelProvider {
@@ -42,6 +47,7 @@ impl Default for BlaxelProvider {
             tap_device: None,
             before_checkpoint: None,
             after_checkpoint: None,
+            jailer_pid: None,
         }
     }
 }
@@ -63,6 +69,7 @@ impl BlaxelProvider {
 
 impl SandboxProvider for BlaxelProvider {
     fn attach(&self, sandbox_id: &str) -> Result<Box<dyn Iterator<Item = CapturedEvent>>> {
+        let trace_id = uuid::Uuid::new_v4().to_string();
         let before_label = self.before_checkpoint.as_deref().unwrap_or("init");
         let after_label = self.after_checkpoint.as_deref().unwrap_or("latest");
 
@@ -84,19 +91,47 @@ impl SandboxProvider for BlaxelProvider {
             "attaching to Blaxel VM"
         );
 
-        let config = FsTrackingConfig {
+        let fs_config = FsTrackingConfig {
             agent_id: sandbox_id.to_string(),
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id: trace_id.clone(),
             method: FsTrackingMethod::SnapshotDiff {
                 before: before_dir,
                 after: after_dir,
             },
         };
 
-        let fs_events = capture_fs_changes(&config)
+        let mut events = capture_fs_changes(&fs_config)
             .context("Blaxel filesystem capture failed")?;
 
-        Ok(Box::new(fs_events.into_iter()))
+        // Network capture via tap device (if configured).
+        if let Some(tap) = &self.tap_device {
+            let net_config = NetworkCaptureConfig {
+                tap_device: tap.clone(),
+                agent_id: sandbox_id.to_string(),
+                trace_id: trace_id.clone(),
+                ..Default::default()
+            };
+            match capture_egress(&net_config) {
+                Ok(net_events) => events.extend(net_events),
+                Err(e) => tracing::warn!(error = %e, "network capture failed, continuing without it"),
+            }
+        }
+
+        // Syscall capture via ptrace on the jailer process (if configured).
+        if let Some(pid) = self.jailer_pid {
+            let sc_config = SyscallMonitorConfig {
+                jailer_pid: pid,
+                agent_id: sandbox_id.to_string(),
+                trace_id,
+                ..Default::default()
+            };
+            match capture_syscalls(&sc_config) {
+                Ok(sc_events) => events.extend(sc_events),
+                Err(e) => tracing::warn!(error = %e, "syscall capture failed, continuing without it"),
+            }
+        }
+
+        Ok(Box::new(events.into_iter()))
     }
 
     fn name(&self) -> &str {

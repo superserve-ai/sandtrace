@@ -93,6 +93,7 @@ pub fn create_provider(kind: ProviderKind) -> Box<dyn SandboxProvider> {
             socket_path: "/run/firecracker.socket".to_string(),
             tap_device: "tap0".to_string(),
             overlay_upper_dir: "/overlay/upper".to_string(),
+            jailer_pid: None,
         }),
     }
 }
