@@ -127,6 +127,14 @@ impl PolicyManifest {
     pub fn effective_mode(&self) -> PolicyMode {
         self.mode.unwrap_or(PolicyMode::Enforce)
     }
+
+    /// Returns `true` if this manifest uses the v2 schema (version "2.0").
+    ///
+    /// V2 policies support match, threshold, and sequence rules and should be
+    /// evaluated through [`PolicyEngine`] to maintain stateful rule state.
+    pub fn is_v2(&self) -> bool {
+        self.schema_version == "2.0"
+    }
 }
 
 // ---------------------------------------------------------------------------

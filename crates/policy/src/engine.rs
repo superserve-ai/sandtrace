@@ -335,6 +335,29 @@ impl PolicyEngine {
         &self.policy
     }
 
+    /// Evaluate all events in order, returning violations (deny/anomaly verdicts).
+    ///
+    /// This is the v2 equivalent of `check_events` — it processes events
+    /// sequentially so that stateful rules (threshold, sequence) accumulate
+    /// state across the batch.
+    pub fn check_events(&mut self, events: &[AuditEvent]) -> Vec<crate::Violation> {
+        let mut violations = Vec::new();
+        for event in events {
+            let verdict = self.evaluate(event);
+            match verdict.result.as_str() {
+                "deny" | "anomaly" => {
+                    violations.push(crate::Violation {
+                        event_id: event.event_id.clone(),
+                        rule_id: verdict.policy_rule,
+                        reason: verdict.reason,
+                    });
+                }
+                _ => {}
+            }
+        }
+        violations
+    }
+
     /// Evaluate a single event against the policy, returning a verdict.
     ///
     /// Uses first-match rule ordering: rules are checked in manifest order and
