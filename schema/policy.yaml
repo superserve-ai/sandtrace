@@ -1,20 +1,63 @@
-# Sandtrace policy manifest
-# Declares the tool endpoints an agent is permitted to contact.
-# Any egress not matching a rule here is flagged as a violation.
-# File access not matching a filesystem rule is flagged as unauthorized.
+# Sandtrace policy manifest (v2)
+# Declares permitted behavior for AI agent sandboxes.
+# Rules are evaluated in first-match order: the first matching rule determines
+# the verdict. This enables deny-before-allow patterns.
 
-schema_version: "1.0"
+schema_version: "2.0"
+mode: enforce
 
 rules:
-  - id: tool:read_file
+  # Deny exfiltration to unknown hosts (first-match: deny before allow)
+  - id: deny:unknown-egress
+    type: match
+    action: deny
+    description: Block egress to hosts not in the allowlist
+    match:
+      event_type:
+        equals: network_egress
+      dest_host:
+        not_in:
+          - api.stripe.com
+          - api.openai.com
+
+  # Detect read-then-send exfiltration pattern
+  - id: seq:exfil-pattern
+    type: sequence
+    action: deny
+    description: Flag credential read followed by network send
+    sequence:
+      window: 10m
+      steps:
+        - event_type:
+            equals: filesystem_summary
+          path:
+            glob: "/home/agent/credentials*"
+        - event_type:
+            equals: network_egress
+
+  # Rate-limit API calls
+  - id: rate:api-calls
+    type: threshold
+    action: deny
+    description: Cap API calls to 100 per 5-minute window
+    threshold:
+      metric: count
+      window: 5m
+      limit: 100.0
+
+  # Filesystem access (read-write within workspace)
+  - id: fs:workspace
     type: filesystem
-    description: Local file reads within agent workspace
+    access: read-write
+    description: Agent workspace file access
     paths:
       - /home/agent/**
       - /tmp/**
 
+  # Network egress allowlist
   - id: tool:stripe_charge
     type: network_egress
+    description: Stripe charges with payload size cap
     destinations:
       - host: api.stripe.com
         port: 443
@@ -22,6 +65,7 @@ rules:
 
   - id: tool:openai_inference
     type: network_egress
+    description: OpenAI inference calls
     destinations:
       - host: api.openai.com
         port: 443

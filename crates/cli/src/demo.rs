@@ -22,7 +22,8 @@ pub fn run(scenario: &str) -> Result<()> {
 fn demo_policy() -> PolicyManifest {
     sandtrace_policy::load_policy(
         r#"
-schema_version: "1.0"
+schema_version: "2.0"
+mode: enforce
 rules:
   - id: tool:stripe_charge
     type: network_egress
@@ -34,6 +35,7 @@ rules:
 
   - id: tool:read_file
     type: filesystem
+    access: read-write
     paths:
       - /home/agent/**
       - /tmp/**
@@ -414,7 +416,7 @@ fn run_persist() -> Result<()> {
 /// Build a minimal AuditEvent for policy evaluation (not written to chain).
 fn stub_event(event_type: &str, payload: &serde_json::Value) -> sandtrace_audit_chain::AuditEvent {
     sandtrace_audit_chain::AuditEvent {
-        schema_version: "1.0".into(),
+        schema_version: "2.0".into(),
         event_id: "eval".into(),
         event_type: event_type.into(),
         agent_id: String::new(),

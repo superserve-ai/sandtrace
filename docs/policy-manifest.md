@@ -1,20 +1,35 @@
 # Policy Manifest Reference
 
-A policy manifest declares expected agent behavior. Sandtrace evaluates every captured event against these rules and assigns a verdict.
+A policy manifest declares expected agent behavior. Sandtrace evaluates every captured event against these rules and assigns a verdict. Rules are evaluated in first-match order: the first matching rule determines the verdict, enabling deny-before-allow patterns.
 
 ## Structure
 
 ```yaml
-schema_version: "1.0"
+schema_version: "2.0"
+mode: enforce          # or "audit" (log-only, no blocking)
 
 rules:
   - id: <unique-rule-id>
     type: <rule-type>
+    action: allow       # or "deny"
+    mode: audit         # per-rule override (optional)
+    description: "..."  # optional
     # type-specific fields...
 ```
 
-- `schema_version` — must be `"1.0"`
-- `rules` — list of rule objects
+- `schema_version` — must be `"2.0"`
+- `mode` — global policy mode: `enforce` (block violations) or `audit` (log only). Defaults to `enforce`.
+- `rules` — list of rule objects, evaluated in order (first match wins)
+
+### Common rule fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | yes | Unique rule identifier |
+| `type` | yes | Rule type (see below) |
+| `action` | no | `allow` or `deny` (default: `allow`) |
+| `mode` | no | Per-rule mode override: `audit` or `enforce` |
+| `description` | no | Human-readable description |
 
 ## Rule types
 
@@ -34,9 +49,6 @@ Controls which network destinations the agent may contact.
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `id` | yes | Unique rule identifier |
-| `type` | yes | Must be `network_egress` |
-| `description` | no | Human-readable description |
 | `destinations` | yes | List of allowed host:port pairs |
 | `destinations[].host` | yes | Hostname or IP (supports wildcards) |
 | `destinations[].port` | yes | TCP/UDP port number |
@@ -44,12 +56,12 @@ Controls which network destinations the agent may contact.
 
 ### `filesystem`
 
-Controls which filesystem paths the agent may access.
+Controls which filesystem paths the agent may access, with optional access level presets.
 
 ```yaml
-- id: tool:read_file
+- id: fs:workspace
   type: filesystem
-  description: "Local file reads within agent workspace"
+  access: read-write
   paths:
     - /home/agent/**
     - /tmp/**
@@ -57,10 +69,84 @@ Controls which filesystem paths the agent may access.
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `id` | yes | Unique rule identifier |
-| `type` | yes | Must be `filesystem` |
-| `description` | no | Human-readable description |
+| `access` | no | Access preset: `read-only`, `read-write`, or `full` |
 | `paths` | yes | List of allowed path patterns (supports wildcards) |
+
+### `match`
+
+Field predicate rules that match events based on payload field values. Supports variable binding for downstream use.
+
+```yaml
+- id: deny:exfil
+  type: match
+  action: deny
+  match:
+    event_type:
+      equals: network_egress
+    dest_host:
+      not_in:
+        - api.stripe.com
+        - api.openai.com
+  bind:
+    host: dest_host
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `match` | yes | Map of field name to predicate. All predicates must match. |
+| `bind` | no | Map of variable name to field path, extracted on match |
+
+#### Field predicates
+
+| Predicate | Description | Example |
+|-----------|-------------|---------|
+| `equals` | Exact value match (string, number, or bool) | `equals: network_egress` |
+| `glob` | Glob pattern match (`*`, `**`) | `glob: "*.evil.com"` |
+| `not_in` | Value must not be in the given set | `not_in: [api.stripe.com, api.openai.com]` |
+
+### `threshold`
+
+Aggregate rules that fire when a metric exceeds a limit over a time window.
+
+```yaml
+- id: rate:api-calls
+  type: threshold
+  action: deny
+  threshold:
+    metric: count
+    field: event_id
+    window: 5m
+    limit: 100.0
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `threshold.metric` | yes | Aggregation type: `count`, `sum`, or `rate` |
+| `threshold.field` | no | Field to aggregate (required for `sum`, optional otherwise) |
+| `threshold.window` | yes | Time window, e.g. `5m`, `1h`, `30s` |
+| `threshold.limit` | yes | Maximum allowed value before the rule fires |
+
+### `sequence`
+
+Ordered event pattern detection within a time window.
+
+```yaml
+- id: seq:exfil-pattern
+  type: sequence
+  action: deny
+  sequence:
+    window: 10m
+    steps:
+      - event_type:
+          equals: filesystem_summary
+      - event_type:
+          equals: network_egress
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `sequence.window` | yes | Time window for the entire sequence |
+| `sequence.steps` | yes | Ordered list of predicate sets (each step uses the same predicates as `match` rules) |
 
 ## Wildcard patterns
 
@@ -121,19 +207,54 @@ The verdict is attached to each event in the audit trail:
 ## Full example
 
 ```yaml
-schema_version: "1.0"
+schema_version: "2.0"
+mode: enforce
 
 rules:
-  - id: tool:read_file
+  # Deny-before-allow: block unknown destinations first
+  - id: deny:unknown-egress
+    type: match
+    action: deny
+    match:
+      event_type:
+        equals: network_egress
+      dest_host:
+        not_in:
+          - api.stripe.com
+          - api.openai.com
+
+  # Detect exfiltration pattern
+  - id: seq:exfil-pattern
+    type: sequence
+    action: deny
+    sequence:
+      window: 10m
+      steps:
+        - event_type:
+            equals: filesystem_summary
+        - event_type:
+            equals: network_egress
+
+  # Rate limiting
+  - id: rate:api-calls
+    type: threshold
+    action: deny
+    threshold:
+      metric: count
+      window: 5m
+      limit: 100.0
+
+  # Filesystem access
+  - id: fs:workspace
     type: filesystem
-    description: Local file reads within agent workspace
+    access: read-write
     paths:
       - /home/agent/**
       - /tmp/**
 
+  # Network egress allowlist
   - id: tool:stripe_charge
     type: network_egress
-    description: Stripe payment processing
     destinations:
       - host: api.stripe.com
         port: 443
@@ -141,7 +262,6 @@ rules:
 
   - id: tool:openai_inference
     type: network_egress
-    description: OpenAI API calls for LLM inference
     destinations:
       - host: api.openai.com
         port: 443
