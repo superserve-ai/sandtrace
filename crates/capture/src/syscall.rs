@@ -300,13 +300,17 @@ mod linux_ptrace {
         let _guard = DetachGuard(pid);
 
         // Interrupt to configure options.
-        unsafe {
+        let ret = unsafe {
             libc::ptrace(
                 PTRACE_INTERRUPT,
                 pid,
                 ptr::null_mut::<libc::c_void>(),
                 ptr::null_mut::<libc::c_void>(),
-            );
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context(format!("ptrace INTERRUPT on pid {pid}"));
         }
 
         // Wait for the process to stop.
@@ -316,13 +320,17 @@ mod linux_ptrace {
         }
 
         // Enable TRACESYSGOOD so we can distinguish syscall stops.
-        unsafe {
+        let ret = unsafe {
             libc::ptrace(
                 libc::PTRACE_SETOPTIONS,
                 pid,
                 ptr::null_mut::<libc::c_void>(),
                 libc::PTRACE_O_TRACESYSGOOD as *mut libc::c_void,
-            );
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context(format!("ptrace SETOPTIONS on pid {pid}"));
         }
 
         // Resume — stop at next syscall boundary.

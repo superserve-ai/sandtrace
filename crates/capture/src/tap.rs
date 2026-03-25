@@ -40,7 +40,7 @@ impl TapSniffer {
         let fd = unsafe {
             libc::socket(
                 libc::AF_PACKET,
-                libc::SOCK_RAW,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
                 (libc::ETH_P_ALL as u16).to_be() as i32,
             )
         };
