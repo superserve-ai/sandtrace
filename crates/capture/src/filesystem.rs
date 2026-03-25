@@ -649,7 +649,7 @@ mod inotify_watcher {
                                 }
 
                                 // New subdirectory — add watches.
-                                if event.mask.contains(EventMask::IS_DIR)
+                                if event.mask.contains(EventMask::ISDIR)
                                     && (event.mask.contains(EventMask::CREATE)
                                         || event.mask.contains(EventMask::MOVED_TO))
                                 {
