@@ -116,9 +116,45 @@ pub fn capture_fs_changes(config: &FsTrackingConfig) -> Result<Vec<CapturedEvent
 
 /// Continuously watches filesystem changes and sends events through a channel.
 ///
-/// Polls the filesystem on `poll_interval`, compares against the previous state,
-/// and emits events only when new changes are detected.
+/// On Linux with `OverlayUpperDir`, uses inotify for near-instant detection
+/// with a periodic full-scan fallback every 30 seconds. Falls back to polling
+/// if inotify is unavailable or for other tracking methods.
 pub fn watch_fs_changes(
+    config: &FsTrackingConfig,
+    tx: std::sync::mpsc::Sender<CapturedEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    poll_interval: std::time::Duration,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let FsTrackingMethod::OverlayUpperDir { upper_dir } = &config.method {
+        match inotify_watcher::OverlayInotifyWatcher::new(upper_dir) {
+            Ok(mut watcher) => {
+                tracing::info!(
+                    dir = %upper_dir.display(),
+                    "using inotify for filesystem watching"
+                );
+                return watcher.run_loop(
+                    &config.agent_id,
+                    &config.trace_id,
+                    &tx,
+                    &shutdown,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "inotify unavailable, falling back to polling"
+                );
+            }
+        }
+    }
+
+    watch_fs_changes_polling(config, tx, shutdown, poll_interval)
+}
+
+/// Polling-based filesystem watcher. Used as fallback when inotify is
+/// unavailable, for `SnapshotDiff` tracking, or on non-Linux platforms.
+fn watch_fs_changes_polling(
     config: &FsTrackingConfig,
     tx: std::sync::mpsc::Sender<CapturedEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -398,6 +434,287 @@ fn walk_tree_inner(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// inotify-based watcher (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod inotify_watcher {
+    use std::collections::HashMap;
+    use std::os::fd::AsRawFd;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result};
+    use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
+
+    use super::{scan_overlay_upper, FsSummary};
+    use crate::CapturedEvent;
+
+    /// After an inotify event, wait this long for more events before scanning.
+    const DEBOUNCE_MS: u64 = 200;
+
+    /// Periodic full-scan interval as a safety net for missed events.
+    const PERIODIC_SCAN_SECS: u64 = 30;
+
+    /// Buffer size for reading inotify events (~100 events).
+    const INOTIFY_BUF_SIZE: usize = 4096;
+
+    /// Maximum number of inotify watches to prevent exhausting system limits.
+    /// Default `max_user_watches` is 8192 on most systems; we stay well under.
+    const MAX_WATCHES: usize = 4096;
+
+    pub(super) struct OverlayInotifyWatcher {
+        inotify: Inotify,
+        watches: HashMap<WatchDescriptor, PathBuf>,
+        upper_dir: PathBuf,
+    }
+
+    /// The watch mask for overlay directories.
+    fn watch_mask() -> WatchMask {
+        WatchMask::CREATE
+            | WatchMask::MODIFY
+            | WatchMask::DELETE
+            | WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::DELETE_SELF
+            | WatchMask::ATTRIB
+            | WatchMask::DONT_FOLLOW
+    }
+
+    impl OverlayInotifyWatcher {
+        pub(super) fn new(upper_dir: &Path) -> Result<Self> {
+            let inotify = Inotify::init().context("inotify init")?;
+            let mut watcher = Self {
+                inotify,
+                watches: HashMap::new(),
+                upper_dir: upper_dir.to_path_buf(),
+            };
+            watcher.add_watches_recursive(upper_dir)?;
+            Ok(watcher)
+        }
+
+        /// Recursively add inotify watches on all directories under `dir`.
+        fn add_watches_recursive(&mut self, dir: &Path) -> Result<()> {
+            if self.watches.len() >= MAX_WATCHES {
+                tracing::warn!(
+                    max = MAX_WATCHES,
+                    "inotify watch limit reached, new subdirectories won't be watched"
+                );
+                return Ok(());
+            }
+
+            // Watch the directory itself.
+            match self.inotify.watches().add(dir, watch_mask()) {
+                Ok(wd) => {
+                    self.watches.insert(wd, dir.to_path_buf());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to add inotify watch"
+                    );
+                    return Ok(());
+                }
+            }
+
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to read directory for inotify setup"
+                    );
+                    return Ok(());
+                }
+            };
+
+            for entry in entries.flatten() {
+                let metadata = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                if metadata.file_type().is_symlink() {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        "skipping symlink during inotify setup"
+                    );
+                    continue;
+                }
+
+                if metadata.is_dir() {
+                    self.add_watches_recursive(&entry.path())?;
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Remove all watches and re-add them (used after Q_OVERFLOW).
+        fn rewatch_all(&mut self) {
+            // Remove existing watches (best-effort).
+            for (wd, _) in self.watches.drain() {
+                let _ = self.inotify.watches().remove(wd);
+            }
+            if let Err(e) = self.add_watches_recursive(&self.upper_dir.clone()) {
+                tracing::warn!(error = %e, "failed to re-establish inotify watches");
+            }
+        }
+
+        /// Check if the summary has changes compared to the previous one.
+        fn has_changes(current: &FsSummary, prev: &Option<FsSummary>) -> bool {
+            match prev {
+                None => {
+                    !current.files_created.is_empty()
+                        || !current.files_modified.is_empty()
+                        || !current.files_deleted.is_empty()
+                }
+                Some(prev) => {
+                    current.files_created != prev.files_created
+                        || current.files_modified != prev.files_modified
+                        || current.files_deleted != prev.files_deleted
+                }
+            }
+        }
+
+        pub(super) fn run_loop(
+            &mut self,
+            agent_id: &str,
+            trace_id: &str,
+            tx: &std::sync::mpsc::Sender<CapturedEvent>,
+            shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Result<()> {
+            // Initial scan.
+            let mut prev_summary: Option<FsSummary> = scan_overlay_upper(&self.upper_dir).ok();
+
+            let fd = self.inotify.as_raw_fd();
+            let mut buf = [0u8; INOTIFY_BUF_SIZE];
+            let mut dirty_since: Option<Instant> = None;
+            let mut last_periodic = Instant::now();
+
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // Compute poll timeout.
+                let timeout_ms = if let Some(since) = dirty_since {
+                    let elapsed = since.elapsed().as_millis() as u64;
+                    if elapsed >= DEBOUNCE_MS {
+                        0 // Debounce expired, scan immediately.
+                    } else {
+                        (DEBOUNCE_MS - elapsed).min(100) as i32
+                    }
+                } else {
+                    let until_periodic = PERIODIC_SCAN_SECS
+                        .saturating_sub(last_periodic.elapsed().as_secs());
+                    if until_periodic == 0 {
+                        0
+                    } else {
+                        (until_periodic * 1000).min(100) as i32
+                    }
+                };
+
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+
+                let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+
+                if ret < 0 {
+                    let errno = std::io::Error::last_os_error();
+                    if errno.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(errno).context("poll on inotify fd");
+                }
+
+                // Read inotify events if available.
+                if ret > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+                    match self.inotify.read_events(&mut buf) {
+                        Ok(events) => {
+                            let mut overflow = false;
+                            for event in events {
+                                if event.mask.contains(EventMask::Q_OVERFLOW) {
+                                    tracing::warn!("inotify queue overflow, re-scanning");
+                                    overflow = true;
+                                    break;
+                                }
+
+                                // New subdirectory — add watches.
+                                if event.mask.contains(EventMask::IS_DIR)
+                                    && (event.mask.contains(EventMask::CREATE)
+                                        || event.mask.contains(EventMask::MOVED_TO))
+                                {
+                                    if let Some(name) = &event.name {
+                                        if let Some(parent) = self.watches.get(&event.wd) {
+                                            let new_dir = parent.join(name);
+                                            let _ = self.add_watches_recursive(&new_dir);
+                                        }
+                                    }
+                                }
+
+                                // Watch removed by kernel.
+                                if event.mask.contains(EventMask::IGNORED) {
+                                    self.watches.remove(&event.wd);
+                                }
+                            }
+
+                            if overflow {
+                                self.rewatch_all();
+                                // Skip debounce, scan immediately.
+                                dirty_since = Some(
+                                    Instant::now() - Duration::from_millis(DEBOUNCE_MS),
+                                );
+                            } else if dirty_since.is_none() {
+                                dirty_since = Some(Instant::now());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to read inotify events");
+                        }
+                    }
+                }
+
+                // Check if we should scan.
+                let should_scan = match dirty_since {
+                    Some(since) => since.elapsed() >= Duration::from_millis(DEBOUNCE_MS),
+                    None => last_periodic.elapsed() >= Duration::from_secs(PERIODIC_SCAN_SECS),
+                };
+
+                if should_scan {
+                    if !self.upper_dir.exists() {
+                        tracing::warn!(
+                            dir = %self.upper_dir.display(),
+                            "overlay upper dir no longer exists, stopping watcher"
+                        );
+                        return Ok(());
+                    }
+
+                    if let Some(summary) = scan_overlay_upper(&self.upper_dir).ok() {
+                        if Self::has_changes(&summary, &prev_summary) {
+                            let event = summary.to_event(agent_id, trace_id);
+                            if tx.send(event).is_err() {
+                                return Ok(());
+                            }
+                            prev_summary = Some(summary);
+                        }
+                    }
+                    dirty_since = None;
+                    last_periodic = Instant::now();
+                }
+            }
+
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

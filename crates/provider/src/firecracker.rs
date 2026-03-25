@@ -135,7 +135,7 @@ impl SandboxProvider for FirecrackerProvider {
                     &config,
                     fs_tx,
                     fs_shutdown,
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(30),
                 ) {
                     tracing::warn!(error = %e, "filesystem watch stopped");
                 }
