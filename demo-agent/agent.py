@@ -133,8 +133,8 @@ def run_persist(backend):
         return s1
 
     # --- session 2 ---
-    print("  waiting 10s to avoid rate limit...\n")
-    time.sleep(10)
+    print("  waiting 60s to avoid rate limit...\n")
+    time.sleep(60)
     print("  SESSION 2 — clean task, no injection, standing instruction fires\n")
     s2 = create_deep_agent(
         model=llm, backend=backend,
