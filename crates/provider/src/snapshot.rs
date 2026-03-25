@@ -1,7 +1,7 @@
 //! Generic snapshot-based provider adapter.
 //!
 //! For providers that expose block-device snapshots or devcontainer
-//! filesystems (E2B, Daytona, Blaxel), this adapter compares two
+//! filesystems (E2B, Daytona), this adapter compares two
 //! directory trees (before and after agent execution) to detect changes.
 
 use std::path::PathBuf;

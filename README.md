@@ -151,7 +151,6 @@ Sandtrace works with any sandbox that runs on Firecracker microVMs:
 | **Firecracker** (raw) | Supported | Direct tap device + jailer integration |
 | **E2B** | Adapter | Hooks into E2B sandbox lifecycle |
 | **Daytona** | Adapter | Devcontainer-based workspace support |
-| **Blaxel** | Adapter | Provider-specific VM management |
 | **Self-hosted** | Supported | Any Linux host running Firecracker |
 
 The provider adapter layer handles the differences between each setup — tap interface naming, rootfs locations, jailer paths, VM metadata — so the capture and policy engines work identically across all of them.

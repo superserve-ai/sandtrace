@@ -1,8 +1,8 @@
 //! Auto-detection of the sandbox provider in the current environment.
 //!
 //! Probes well-known paths and environment variables to determine which
-//! provider adapter to use. Detection order: E2B, Daytona, Blaxel,
-//! then falls back to generic Firecracker.
+//! provider adapter to use. Detection order: E2B, Daytona, then falls
+//! back to generic Firecracker.
 
 use crate::SandboxProvider;
 
@@ -11,7 +11,6 @@ use crate::SandboxProvider;
 pub enum ProviderKind {
     E2b,
     Daytona,
-    Blaxel,
     Firecracker,
 }
 
@@ -20,7 +19,6 @@ impl std::fmt::Display for ProviderKind {
         match self {
             ProviderKind::E2b => write!(f, "e2b"),
             ProviderKind::Daytona => write!(f, "daytona"),
-            ProviderKind::Blaxel => write!(f, "blaxel"),
             ProviderKind::Firecracker => write!(f, "firecracker"),
         }
     }
@@ -28,11 +26,11 @@ impl std::fmt::Display for ProviderKind {
 
 /// Detect which provider is active by probing the environment.
 ///
-/// Checks in order: E2B, Daytona, Blaxel. Falls back to generic
-/// Firecracker if none of the provider-specific markers are found.
+/// Checks in order: E2B, Daytona. Falls back to generic Firecracker
+/// if none of the provider-specific markers are found.
 ///
 /// Also checks environment variables:
-/// - `SANDTRACE_PROVIDER` — explicit override (e2b, daytona, blaxel, firecracker)
+/// - `SANDTRACE_PROVIDER` — explicit override (e2b, daytona, firecracker)
 /// - `E2B_SANDBOX_ID` — E2B runtime indicator
 /// - `DAYTONA_WS_ID` — Daytona runtime indicator
 pub fn detect_provider() -> ProviderKind {
@@ -41,7 +39,6 @@ pub fn detect_provider() -> ProviderKind {
         match val.to_lowercase().as_str() {
             "e2b" => return ProviderKind::E2b,
             "daytona" => return ProviderKind::Daytona,
-            "blaxel" => return ProviderKind::Blaxel,
             "firecracker" => return ProviderKind::Firecracker,
             _ => {
                 tracing::warn!(provider = %val, "unknown SANDTRACE_PROVIDER value, auto-detecting");
@@ -64,10 +61,6 @@ pub fn detect_provider() -> ProviderKind {
     if crate::daytona::detect() {
         return ProviderKind::Daytona;
     }
-    if crate::blaxel::detect() {
-        return ProviderKind::Blaxel;
-    }
-
     ProviderKind::Firecracker
 }
 
@@ -88,7 +81,6 @@ pub fn create_provider(kind: ProviderKind) -> Box<dyn SandboxProvider> {
     match kind {
         ProviderKind::E2b => Box::new(crate::e2b::E2bProvider::default()),
         ProviderKind::Daytona => Box::new(crate::daytona::DaytonaProvider::default()),
-        ProviderKind::Blaxel => Box::new(crate::blaxel::BlaxelProvider::default()),
         ProviderKind::Firecracker => Box::new(crate::firecracker::FirecrackerProvider {
             socket_path: "/run/firecracker.socket".to_string(),
             tap_device: "tap0".to_string(),
@@ -113,7 +105,6 @@ mod tests {
     fn display_provider_kinds() {
         assert_eq!(ProviderKind::E2b.to_string(), "e2b");
         assert_eq!(ProviderKind::Daytona.to_string(), "daytona");
-        assert_eq!(ProviderKind::Blaxel.to_string(), "blaxel");
         assert_eq!(ProviderKind::Firecracker.to_string(), "firecracker");
     }
 
@@ -123,9 +114,9 @@ mod tests {
     fn detect_env_var_precedence() {
         // Explicit override takes highest priority.
         clean_env();
-        std::env::set_var("SANDTRACE_PROVIDER", "blaxel");
+        std::env::set_var("SANDTRACE_PROVIDER", "daytona");
         std::env::set_var("E2B_SANDBOX_ID", "sb-test"); // should be ignored
-        assert_eq!(detect_provider(), ProviderKind::Blaxel);
+        assert_eq!(detect_provider(), ProviderKind::Daytona);
 
         // E2B env var detection.
         clean_env();
@@ -151,9 +142,6 @@ mod tests {
 
         let p = create_provider(ProviderKind::Daytona);
         assert_eq!(p.name(), "daytona");
-
-        let p = create_provider(ProviderKind::Blaxel);
-        assert_eq!(p.name(), "blaxel");
 
         let p = create_provider(ProviderKind::Firecracker);
         assert_eq!(p.name(), "firecracker");
