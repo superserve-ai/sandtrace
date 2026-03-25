@@ -10,7 +10,7 @@ Usage:
     python agent.py
 """
 
-import json
+import json, socket
 from daytona import Daytona, CreateSandboxFromSnapshotParams
 from langchain_daytona import DaytonaSandbox
 from langchain_openai import ChatOpenAI
@@ -70,10 +70,12 @@ def print_trace(messages):
 def run():
     print(f"\n{'='*60}\n  exploit: allowed-channel exfiltration (Stripe)\n{'='*60}\n")
 
+    # resolve IPs at runtime — network_allow_list requires IPv4
+    httpbin_ip = socket.gethostbyname("httpbin.org")
     client = Daytona()
     sandbox = client.create(CreateSandboxFromSnapshotParams(
         network_block_all=True,
-        network_allow_list="httpbin.org",  # stands in for api.stripe.com
+        network_allow_list=httpbin_ip,  # httpbin.org — stands in for api.stripe.com
     ))
     backend = DaytonaSandbox(sandbox=sandbox)
     backend.upload_files([(f"{ROOT}/{k}", v.encode()) for k, v in WORKSPACE_FILES.items()])
