@@ -10,5 +10,6 @@ serde.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 
 sandtrace-audit-chain = { path = "../audit-chain" }

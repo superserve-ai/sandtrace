@@ -1,7 +1,11 @@
+pub mod engine;
+
 use anyhow::{Context, Result};
 use sandtrace_audit_chain::{AuditEvent, Verdict};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub use engine::PolicyEngine;
 
 // ---------------------------------------------------------------------------
 // Core enums
@@ -359,7 +363,7 @@ pub fn check_events(
 /// - `api.stripe.com` — exact match
 /// - `*.stripe.com` — matches any single subdomain (e.g. `api.stripe.com`)
 /// - `**.stripe.com` — matches any depth of subdomains (e.g. `a.b.stripe.com`)
-fn host_matches(pattern: &str, host: &str) -> bool {
+pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
     if pattern == host {
         return true;
     }
@@ -383,7 +387,7 @@ fn host_matches(pattern: &str, host: &str) -> bool {
 /// - `/home/agent/**` — matches anything under `/home/agent/`
 /// - `/tmp/*.log` — matches `*.log` files directly in `/tmp/`
 /// - `/home/*/config` — matches one directory level wildcard
-fn path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
     if pattern == path {
         return true;
     }
