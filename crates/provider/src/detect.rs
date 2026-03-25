@@ -90,10 +90,15 @@ pub fn create_provider(kind: ProviderKind) -> Box<dyn SandboxProvider> {
         ProviderKind::Daytona => Box::new(crate::daytona::DaytonaProvider::default()),
         ProviderKind::Blaxel => Box::new(crate::blaxel::BlaxelProvider::default()),
         ProviderKind::Firecracker => Box::new(crate::firecracker::FirecrackerProvider {
-            socket_path: "/run/firecracker.socket".to_string(),
-            tap_device: "tap0".to_string(),
-            overlay_upper_dir: "/overlay/upper".to_string(),
-            jailer_pid: None,
+            socket_path: std::env::var("FC_SOCKET_PATH")
+                .unwrap_or_else(|_| "/run/firecracker.socket".to_string()),
+            tap_device: std::env::var("FC_TAP_DEVICE")
+                .unwrap_or_else(|_| "tap0".to_string()),
+            overlay_upper_dir: std::env::var("FC_OVERLAY_UPPER")
+                .unwrap_or_else(|_| "/overlay/upper".to_string()),
+            jailer_pid: std::env::var("FC_JAILER_PID")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }),
     }
 }
