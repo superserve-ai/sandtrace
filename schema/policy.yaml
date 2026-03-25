@@ -1,0 +1,24 @@
+# Sandtrace policy manifest
+# Declares the tool endpoints an agent is permitted to contact.
+# Any egress not matching a rule here is flagged as a violation.
+
+schema_version: "1.0"
+
+rules:
+  - id: tool:read_file
+    type: filesystem
+    description: Local file reads
+
+  - id: tool:stripe_charge
+    type: network_egress
+    destinations:
+      - host: api.stripe.com
+        port: 443
+    max_bytes_per_call: 4096
+
+  - id: tool:openai_inference
+    type: network_egress
+    destinations:
+      - host: api.openai.com
+        port: 443
+    max_bytes_per_call: 32768

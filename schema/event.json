@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "AuditEvent",
+  "description": "Canonical Sandtrace audit event",
+  "type": "object",
+  "required": ["schema_version", "event_id", "event_type", "agent_id", "trace_id", "seq", "record_hash", "wall_time", "evidence_tier", "payload"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "event_id": { "type": "string" },
+    "event_type": { "type": "string", "enum": ["network_egress", "policy_violation", "filesystem_summary"] },
+    "agent_id": { "type": "string" },
+    "trace_id": { "type": "string" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "prev_hash": { "type": ["string", "null"] },
+    "record_hash": { "type": "string" },
+    "wall_time": { "type": "string", "format": "date-time" },
+    "evidence_tier": { "type": "string" },
+    "payload": { "type": "object" },
+    "verdict": {
+      "type": "object",
+      "properties": {
+        "result": { "type": "string", "enum": ["allow", "deny", "anomaly"] },
+        "policy_rule": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}
