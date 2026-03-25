@@ -4,6 +4,7 @@ members = [
     "crates/capture",
     "crates/policy",
     "crates/audit-chain",
+    "crates/output",
     "crates/provider",
 ]
 resolver = "2"
@@ -25,4 +26,5 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 tracing = "0.1"
+thiserror = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

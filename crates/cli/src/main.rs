@@ -27,9 +27,25 @@ enum Command {
         #[arg(long)]
         sandbox_id: String,
 
-        /// Output file for JSONL audit events (defaults to stdout)
-        #[arg(short, long)]
-        output: Option<String>,
+        /// Output target: file path, `-` for stdout, or `unix:///path` for Unix socket
+        #[arg(short, long, default_value = "-")]
+        output: String,
+
+        /// Filter by event type (comma-separated, e.g. "network_egress,filesystem_summary")
+        #[arg(long)]
+        filter_type: Option<String>,
+
+        /// Filter by evidence tier (comma-separated, e.g. "hypervisor,kernel")
+        #[arg(long)]
+        filter_tier: Option<String>,
+
+        /// Filter by verdict result (comma-separated, e.g. "deny,anomaly")
+        #[arg(long)]
+        filter_verdict: Option<String>,
+
+        /// Disable schema validation on output events
+        #[arg(long)]
+        no_validate: bool,
     },
 
     /// Verify a JSONL audit trail for integrity and policy compliance
@@ -46,6 +62,32 @@ enum Command {
         json: bool,
     },
 
+    /// Stream events from a JSONL file through the output pipeline
+    Stream {
+        /// Path to the JSONL audit trail file to stream
+        path: String,
+
+        /// Output target: file path, `-` for stdout, or `unix:///path` for Unix socket
+        #[arg(short, long, default_value = "-")]
+        output: String,
+
+        /// Filter by event type (comma-separated)
+        #[arg(long)]
+        filter_type: Option<String>,
+
+        /// Filter by evidence tier (comma-separated)
+        #[arg(long)]
+        filter_tier: Option<String>,
+
+        /// Filter by verdict result (comma-separated)
+        #[arg(long)]
+        filter_verdict: Option<String>,
+
+        /// Disable schema validation on output events
+        #[arg(long)]
+        no_validate: bool,
+    },
+
     /// Run the demo scenario showing exfiltration detection
     Demo {
         /// Scenario to run
@@ -54,7 +96,8 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -79,7 +122,22 @@ fn main() -> Result<()> {
         Command::Watch {
             sandbox_id,
             output,
-        } => cmd_watch(sandbox_id, output, policy),
+            filter_type,
+            filter_tier,
+            filter_verdict,
+            no_validate,
+        } => {
+            cmd_watch(
+                sandbox_id,
+                output,
+                policy,
+                filter_type,
+                filter_tier,
+                filter_verdict,
+                no_validate,
+            )
+            .await
+        }
         Command::Verify { path, against, json } => {
             let verify_policy = match against {
                 Some(ref p) => Some(sandtrace_policy::load_policy_file(p)?),
@@ -87,14 +145,61 @@ fn main() -> Result<()> {
             };
             cmd_verify(path, verify_policy, json)
         }
+        Command::Stream {
+            path,
+            output,
+            filter_type,
+            filter_tier,
+            filter_verdict,
+            no_validate,
+        } => {
+            cmd_stream(
+                path,
+                output,
+                filter_type,
+                filter_tier,
+                filter_verdict,
+                no_validate,
+            )
+            .await
+        }
         Command::Demo { scenario } => cmd_demo(scenario),
     }
 }
 
-fn cmd_watch(
+fn build_filter(
+    filter_type: Option<String>,
+    filter_tier: Option<String>,
+    filter_verdict: Option<String>,
+) -> sandtrace_output::EventFilter {
+    let mut filter = sandtrace_output::EventFilter::new();
+
+    if let Some(types) = filter_type {
+        let types: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
+        filter = filter.with_event_types(types);
+    }
+
+    if let Some(tiers) = filter_tier {
+        let tiers: Vec<String> = tiers.split(',').map(|s| s.trim().to_string()).collect();
+        filter = filter.with_evidence_tiers(tiers);
+    }
+
+    if let Some(verdicts) = filter_verdict {
+        let results: Vec<String> = verdicts.split(',').map(|s| s.trim().to_string()).collect();
+        filter = filter.with_verdict(sandtrace_output::VerdictFilter::Only(results));
+    }
+
+    filter
+}
+
+async fn cmd_watch(
     sandbox_id: String,
-    output: Option<String>,
+    output: String,
     policy: Option<sandtrace_policy::PolicyManifest>,
+    filter_type: Option<String>,
+    filter_tier: Option<String>,
+    filter_verdict: Option<String>,
+    no_validate: bool,
 ) -> Result<()> {
     tracing::info!(sandbox_id, "attaching to sandbox");
 
@@ -102,11 +207,44 @@ fn cmd_watch(
         tracing::info!(rules = policy.rules.len(), "loaded policy");
     }
 
-    let _output = output.as_deref().unwrap_or("-");
+    let sink = sandtrace_output::OutputSink::from_target(&output).await?;
+    let filter = build_filter(filter_type, filter_tier, filter_verdict);
+
+    let _stream = sandtrace_output::EventOutputStream::new(vec![sink])
+        .with_filter(filter)
+        .with_validation(!no_validate);
+
+    tracing::info!(output, "output pipeline ready");
 
     // Placeholder: real implementation will attach to Firecracker tap
-    // interface, mount overlay fs, and install seccomp-bpf filters.
+    // interface, mount overlay fs, and install seccomp-bpf filters,
+    // then feed captured events through the output stream.
     tracing::warn!("watch command is not yet implemented — capture crates pending");
+    Ok(())
+}
+
+async fn cmd_stream(
+    path: String,
+    output: String,
+    filter_type: Option<String>,
+    filter_tier: Option<String>,
+    filter_verdict: Option<String>,
+    no_validate: bool,
+) -> Result<()> {
+    tracing::info!(path, "streaming events");
+
+    let events = sandtrace_audit_chain::read_jsonl(&path)?;
+    let sink = sandtrace_output::OutputSink::from_target(&output).await?;
+    let filter = build_filter(filter_type, filter_tier, filter_verdict);
+
+    let mut stream = sandtrace_output::EventOutputStream::new(vec![sink])
+        .with_filter(filter)
+        .with_validation(!no_validate);
+
+    stream.emit_all(&events).await?;
+    stream.flush().await?;
+
+    tracing::info!(count = events.len(), "streaming complete");
     Ok(())
 }
 
