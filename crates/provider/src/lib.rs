@@ -5,6 +5,7 @@
 //! `CapturedEvent`s.
 
 pub mod firecracker;
+pub mod snapshot;
 
 use anyhow::Result;
 use sandtrace_capture::CapturedEvent;
