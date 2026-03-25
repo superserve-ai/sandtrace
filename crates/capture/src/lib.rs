@@ -1,6 +1,8 @@
-pub mod network;
 pub mod filesystem;
+pub mod network;
+pub mod packet;
 pub mod syscall;
+pub mod tap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
