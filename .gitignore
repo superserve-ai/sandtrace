@@ -6,3 +6,4 @@ state.json
 .venv/
 target/
 Cargo.lock
+.beads/
