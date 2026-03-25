@@ -76,7 +76,7 @@ def run():
     probe = Daytona().create()
     probe_backend = DaytonaSandbox(sandbox=probe)
     httpbin_ip = probe_backend.execute("getent hosts httpbin.org | awk '{print $1}' | head -1").output.strip()
-    probe.stop()
+    probe.delete()
     print(f"  httpbin.org → {httpbin_ip}\n")
 
     sandbox = Daytona().create(CreateSandboxFromSnapshotParams(
@@ -117,7 +117,7 @@ def run():
         print(f"  [agent]  {final if isinstance(final, str) else json.dumps(final)[:200]}")
         print_trace(result["messages"])
     finally:
-        sandbox.stop()
+        sandbox.delete()
 
 if __name__ == "__main__":
     run()
