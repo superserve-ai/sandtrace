@@ -208,22 +208,66 @@ pub fn verify_chain(events: &[AuditEvent]) -> Result<ChainVerification> {
 ///
 /// The hash covers: event_id, event_type, agent_id, trace_id, seq,
 /// prev_hash, wall_time, evidence_tier, and the canonical JSON payload.
+///
+/// Each variable-length field is length-prefixed (8-byte little-endian length)
+/// to prevent field boundary ambiguity (e.g., event_id="ab" + event_type="cd"
+/// must not collide with event_id="abc" + event_type="d").
+///
+/// The payload is serialized as canonical JSON with sorted keys to ensure
+/// deterministic hashing regardless of deserialization order.
 pub fn compute_record_hash(event: &AuditEvent) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(event.event_id.as_bytes());
-    hasher.update(event.event_type.as_bytes());
-    hasher.update(event.agent_id.as_bytes());
-    hasher.update(event.trace_id.as_bytes());
-    hasher.update(event.seq.to_le_bytes());
-    hasher.update(event.prev_hash.as_deref().unwrap_or("null").as_bytes());
-    hasher.update(event.wall_time.as_bytes());
-    hasher.update(event.evidence_tier.as_bytes());
 
-    // Canonical JSON for payload
-    let payload_str = serde_json::to_string(&event.payload).unwrap_or_default();
-    hasher.update(payload_str.as_bytes());
+    // Helper: hash a string field with length prefix
+    let hash_str = |hasher: &mut Sha256, s: &str| {
+        hasher.update((s.len() as u64).to_le_bytes());
+        hasher.update(s.as_bytes());
+    };
+
+    hash_str(&mut hasher, &event.event_id);
+    hash_str(&mut hasher, &event.event_type);
+    hash_str(&mut hasher, &event.agent_id);
+    hash_str(&mut hasher, &event.trace_id);
+    hasher.update(event.seq.to_le_bytes());
+    hash_str(
+        &mut hasher,
+        event.prev_hash.as_deref().unwrap_or("null"),
+    );
+    hash_str(&mut hasher, &event.wall_time);
+    hash_str(&mut hasher, &event.evidence_tier);
+
+    // Canonical JSON for payload — sorted keys for determinism
+    let canonical_payload = canonical_json(&event.payload);
+    hash_str(&mut hasher, &canonical_payload);
 
     format!("{:x}", hasher.finalize())
+}
+
+/// Produce a canonical JSON string with sorted keys at all nesting levels.
+///
+/// This ensures that `serde_json::Value` objects serialize deterministically
+/// regardless of insertion order or deserialization source.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let entries: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    let v = canonical_json(&map[k]);
+                    format!("{}:{}", serde_json::to_string(k).unwrap(), v)
+                })
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        // Primitives (strings, numbers, bools, null) serialize deterministically
+        _ => serde_json::to_string(value).unwrap(),
+    }
 }
 
 /// Build a new audit event and chain it to the previous hash.
@@ -687,5 +731,71 @@ mod tests {
         let h2 = compute_record_hash(&event);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn test_field_boundary_no_collision() {
+        // event_id="ab" + event_type="cd" must NOT collide with
+        // event_id="abc" + event_type="d"
+        let base = AuditEvent {
+            schema_version: "1.0".into(),
+            event_id: "ab".into(),
+            event_type: "cd".into(),
+            agent_id: "agent-1".into(),
+            trace_id: "trace-1".into(),
+            seq: 1,
+            prev_hash: None,
+            record_hash: String::new(),
+            wall_time: "2024-01-01T00:00:00Z".into(),
+            evidence_tier: "hypervisor".into(),
+            payload: serde_json::json!({}),
+            verdict: None,
+        };
+
+        let mut shifted = base.clone();
+        shifted.event_id = "abc".into();
+        shifted.event_type = "d".into();
+
+        let h1 = compute_record_hash(&base);
+        let h2 = compute_record_hash(&shifted);
+        assert_ne!(h1, h2, "field boundary shift must produce different hashes");
+    }
+
+    #[test]
+    fn test_canonical_json_key_order() {
+        // Payloads with same keys in different insertion order must hash identically
+        let event1 = AuditEvent {
+            schema_version: "1.0".into(),
+            event_id: "id-1".into(),
+            event_type: "network_egress".into(),
+            agent_id: "agent-1".into(),
+            trace_id: "trace-1".into(),
+            seq: 1,
+            prev_hash: None,
+            record_hash: String::new(),
+            wall_time: "2024-01-01T00:00:00Z".into(),
+            evidence_tier: "hypervisor".into(),
+            payload: serde_json::json!({"alpha": 1, "beta": 2}),
+            verdict: None,
+        };
+
+        // Build payload with reversed key order via a BTreeMap trick
+        let mut map = serde_json::Map::new();
+        map.insert("beta".into(), serde_json::json!(2));
+        map.insert("alpha".into(), serde_json::json!(1));
+        let mut event2 = event1.clone();
+        event2.payload = serde_json::Value::Object(map);
+
+        let h1 = compute_record_hash(&event1);
+        let h2 = compute_record_hash(&event2);
+        assert_eq!(h1, h2, "same payload with different key order must produce same hash");
+    }
+
+    #[test]
+    fn test_canonical_json_nested_objects() {
+        let val = serde_json::json!({"z": {"b": 1, "a": 2}, "a": [3, {"y": 4, "x": 5}]});
+        let canonical = canonical_json(&val);
+        // Keys must be sorted at all levels
+        assert_eq!(canonical, r#"{"a":[3,{"x":5,"y":4}],"z":{"a":2,"b":1}}"#);
     }
 }
