@@ -1,13 +1,17 @@
 # Sandtrace policy manifest
 # Declares the tool endpoints an agent is permitted to contact.
 # Any egress not matching a rule here is flagged as a violation.
+# File access not matching a filesystem rule is flagged as unauthorized.
 
 schema_version: "1.0"
 
 rules:
   - id: tool:read_file
     type: filesystem
-    description: Local file reads
+    description: Local file reads within agent workspace
+    paths:
+      - /home/agent/**
+      - /tmp/**
 
   - id: tool:stripe_charge
     type: network_egress
