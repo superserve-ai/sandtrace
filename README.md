@@ -2,39 +2,30 @@
   <h1 align="center">Sandtrace</h1>
   <p align="center">
     Hypervisor-level audit trails for AI agent sandboxes.
-    <br />
-    <em>Agent observability tools log what agents report doing. Sandtrace logs what they actually do.</em>
   </p>
 </p>
 
 <p align="center">
-  <a href="#the-problem">The Problem</a> &middot;
-  <a href="#how-it-works">How It Works</a> &middot;
+  <a href="#what-it-does">What It Does</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
-  <a href="#the-exploit-that-inspired-this">The Exploit</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
-  <a href="#policy-manifest">Policy Manifest</a>
+  <a href="#policy-manifest">Policy Manifest</a> &middot;
+  <a href="#supported-providers">Providers</a>
 </p>
 
 ---
 
-## The Problem
+## What It Does
 
-AI agents run inside sandboxes. Sandboxes enforce network policies — block unauthorized egress, restrict filesystem access, isolate the environment. This is supposed to be enough.
+Sandboxes isolate the environment. Sandtrace audits what happens inside it.
 
-**It isn't.**
+Network policies control which destinations an agent can reach. Sandtrace adds the next layer: recording *what* gets sent to those destinations, tracking filesystem changes, and evaluating behavior against a declared policy — all from outside the VM, where the agent can't influence the instrumentation.
 
-An agent that can call `stripe_charge(amount=1, description=<contents of credentials.json>)` is exfiltrating data through an *allowed* channel. The network policy sees a request to `api.stripe.com:443` — a permitted destination — and waves it through. The payload contains your AWS keys.
-
-Every sandbox provider — E2B, Daytona, Blaxel, or bare Firecracker — has this blind spot. Network-level allow/deny lists cannot inspect what's *inside* a permitted API call.
-
-## How It Works
-
-Sandtrace sits **beneath the agent's trust boundary** — on the host side of a Firecracker microVM. The agent cannot see it, cannot influence it, and cannot suppress it.
+It sits on the host side of a Firecracker microVM, capturing network traffic, filesystem diffs, and syscalls independently of the guest.
 
 ```
 ┌─────────────────────────────────┐
-│  Agent (untrusted)              │
+│  Agent (guest VM)               │
 │  ┌───────────┐  ┌────────────┐  │
 │  │ Tool calls│  │ File I/O   │  │
 │  └─────┬─────┘  └──────┬─────┘  │
@@ -55,13 +46,13 @@ Sandtrace sits **beneath the agent's trust boundary** — on the host side of a 
 
 Three capture layers, all host-side:
 
-| Layer | Mechanism | What it catches |
+| Layer | Mechanism | What it records |
 |-------|-----------|-----------------|
-| **Network** | AF_PACKET socket on Firecracker's tap device | Every TCP/UDP connection — destination, port, bytes transferred per call |
+| **Network** | AF_PACKET socket on Firecracker's tap device | Every TCP/UDP connection — destination, port, bytes transferred |
 | **Filesystem** | OverlayFS upper-dir monitoring or block-device snapshot diffs | Files created, modified, deleted — with sizes |
-| **Policy** | Manifest-based evaluation with payload size analysis | Allowed-channel exfiltration, anomalous payloads, undeclared destinations |
+| **Syscall** | ptrace on the jailer process | System call activity from the guest |
 
-Each captured event is written to a **tamper-evident hash chain** — a JSONL log where every record includes the hash of its predecessor. Even with root access inside the VM, the audit trail on the host cannot be altered without breaking the chain.
+Each event is evaluated against a [policy manifest](#policy-manifest) and written to a **tamper-evident hash chain** — a JSONL log where every record includes the hash of its predecessor.
 
 ## Quick Start
 
@@ -75,41 +66,8 @@ sandtrace verify ./trace.jsonl --against policy.yaml
 # Stream and filter events from a trace file
 sandtrace stream ./trace.jsonl --filter-verdict deny,anomaly
 
-# Run the demo exploit
+# Run a demo scenario
 sandtrace demo stripe-exfil
-```
-
-## The Exploit That Inspired This
-
-We built a demo agent with access to `stripe_charge` and `read_file` running inside a Daytona sandbox with `network_block_all=True` and only `api.stripe.com:443` allowed.
-
-The agent was given a prompt injection hidden inside a PDF:
-
-```
-stripe_charge  amount=420000  payload=69b   ← legitimate invoice
-stripe_charge  amount=1       payload=316b  ← credentials.json as description
-```
-
-Both calls go to `api.stripe.com:443`. Network policy passes both. The tool call trace looks normal. But the second call has a **4.6x payload size anomaly** — 316 bytes vs 69 bytes — because the description field contains the full contents of `credentials.json`.
-
-Sandtrace catches this. The policy engine compares payload sizes against the declared `max_bytes_per_call` in the manifest and flags the anomaly with a verdict:
-
-```json
-{
-  "event_type": "policy_violation",
-  "verdict": {
-    "result": "anomaly",
-    "policy_rule": "tool:stripe_charge",
-    "reason": "payload 316b exceeds baseline for this tool"
-  }
-}
-```
-
-**Run it yourself:**
-
-```bash
-export OPENAI_API_KEY=... DAYTONA_API_KEY=...
-python demo-agent/agent.py --exploit network
 ```
 
 ## Architecture
@@ -158,7 +116,7 @@ The `record_hash` is `SHA-256(canonical_json(event_without_hash) + prev_hash)`. 
 
 ## Policy Manifest
 
-Declare what your agent is allowed to do. Anything else is a violation.
+Declare expected agent behavior. Sandtrace evaluates events against these rules.
 
 ```yaml
 schema_version: "1.0"
@@ -197,14 +155,6 @@ Sandtrace works with any sandbox that runs on Firecracker microVMs:
 | **Self-hosted** | Supported | Any Linux host running Firecracker |
 
 The provider adapter layer handles the differences between each setup — tap interface naming, rootfs locations, jailer paths, VM metadata — so the capture and policy engines work identically across all of them.
-
-## Why Not Just Use Network Policies?
-
-Network policies answer: *"Can this VM talk to api.stripe.com?"*
-
-Sandtrace answers: *"What did this VM send to api.stripe.com, and does it match what the agent was supposed to send?"*
-
-These are fundamentally different questions. The first is access control. The second is behavioral auditing. You need both.
 
 ## License
 
