@@ -1,3 +1,5 @@
+mod demo;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -326,10 +328,5 @@ fn cmd_verify(
 }
 
 fn cmd_demo(scenario: String) -> Result<()> {
-    tracing::info!(scenario, "running demo scenario");
-
-    // Placeholder: will invoke the Python demo-agent or a Rust-native
-    // version of the scenario, then run verify on the output.
-    tracing::warn!("demo command is not yet implemented");
-    Ok(())
+    demo::run(&scenario)
 }
