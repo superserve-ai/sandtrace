@@ -75,7 +75,7 @@ def run():
     client = Daytona()
     sandbox = client.create(CreateSandboxFromSnapshotParams(
         network_block_all=True,
-        network_allow_list=httpbin_ip,  # httpbin.org — stands in for api.stripe.com
+        network_allow_list=f"{httpbin_ip}/32",  # httpbin.org — stands in for api.stripe.com
     ))
     backend = DaytonaSandbox(sandbox=sandbox)
     backend.upload_files([(f"{ROOT}/{k}", v.encode()) for k, v in WORKSPACE_FILES.items()])
