@@ -59,6 +59,23 @@ pub trait SandboxProvider: Send {
         Ok(())
     }
 
+    /// Discover all running sandboxes managed by this provider.
+    ///
+    /// Returns one [`SandboxInfo`] per running VM/sandbox, each with its own
+    /// configured provider instance ready to attach. Providers that don't
+    /// support discovery return an empty list.
+    fn discover(&self) -> Result<Vec<SandboxInfo>> {
+        Ok(vec![])
+    }
+
     /// Provider name for logging and identification.
     fn name(&self) -> &str;
+}
+
+/// Information about a discovered running sandbox.
+pub struct SandboxInfo {
+    /// Unique identifier for this sandbox (derived from process, socket path, dir name, etc.).
+    pub sandbox_id: String,
+    /// Provider adapter configured for this specific sandbox.
+    pub provider: Box<dyn SandboxProvider>,
 }

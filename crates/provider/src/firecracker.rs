@@ -177,7 +177,129 @@ impl SandboxProvider for FirecrackerProvider {
         Ok(())
     }
 
+    fn discover(&self) -> Result<Vec<crate::SandboxInfo>> {
+        discover_firecracker_vms()
+    }
+
     fn name(&self) -> &str {
         "firecracker"
     }
+}
+
+/// Discover running Firecracker VMs by scanning `/proc` for firecracker processes.
+#[cfg(target_os = "linux")]
+pub fn discover_firecracker_vms() -> Result<Vec<crate::SandboxInfo>> {
+    let mut sandboxes = Vec::new();
+
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Ok(vec![]),
+    };
+
+    for entry in proc_dir.flatten() {
+        let pid_str = entry.file_name().to_string_lossy().to_string();
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Read /proc/{pid}/cmdline (NUL-separated)
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let cmdline = match std::fs::read(&cmdline_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+        let first_arg = std::str::from_utf8(args.first().copied().unwrap_or(&[])).unwrap_or("");
+        if !first_arg.contains("firecracker") {
+            continue;
+        }
+
+        // Extract --api-sock value
+        let socket_path = args
+            .windows(2)
+            .find(|w| std::str::from_utf8(w[0]).ok() == Some("--api-sock"))
+            .and_then(|w| std::str::from_utf8(w[1]).ok())
+            .map(|s| s.to_string());
+
+        let socket_path = match socket_path {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Derive sandbox_id from socket path
+        let sandbox_id = std::path::Path::new(&socket_path)
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("fc-{pid}"));
+
+        // Try to query Firecracker API for tap device
+        let tap_device = query_fc_tap_device(&socket_path)
+            .unwrap_or_else(|_| format!("tap{}", sandboxes.len()));
+
+        // Derive overlay dir from socket dir convention
+        let overlay_upper_dir = std::path::Path::new(&socket_path)
+            .parent()
+            .map(|p| p.join("overlay/upper").to_string_lossy().to_string())
+            .unwrap_or_else(|| "/overlay/upper".to_string());
+
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            pid,
+            socket = %socket_path,
+            tap = %tap_device,
+            "discovered Firecracker VM"
+        );
+
+        sandboxes.push(crate::SandboxInfo {
+            sandbox_id,
+            provider: Box::new(FirecrackerProvider {
+                socket_path,
+                tap_device,
+                overlay_upper_dir,
+                jailer_pid: Some(pid),
+            }),
+        });
+    }
+
+    Ok(sandboxes)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn discover_firecracker_vms() -> Result<Vec<crate::SandboxInfo>> {
+    Ok(vec![])
+}
+
+/// Query the Firecracker API via Unix socket to get the tap device name.
+#[cfg(target_os = "linux")]
+fn query_fc_tap_device(socket_path: &str) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+
+    let request = "GET /network-interfaces HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    stream.write_all(request.as_bytes())?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    // Parse HTTP response — find the JSON body after \r\n\r\n
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("no body in API response"))?;
+
+    let ifaces: serde_json::Value = serde_json::from_str(body)?;
+    let tap = ifaces
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|iface| iface.get("host_dev_name"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no host_dev_name in network interfaces"))?;
+
+    Ok(tap.to_string())
 }

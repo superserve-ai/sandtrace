@@ -147,6 +147,10 @@ impl SandboxProvider for E2bProvider {
         Ok(stream)
     }
 
+    fn discover(&self) -> Result<Vec<crate::SandboxInfo>> {
+        discover_e2b_sandboxes(&self.sandboxes_dir)
+    }
+
     fn name(&self) -> &str {
         "e2b"
     }
@@ -155,6 +159,40 @@ impl SandboxProvider for E2bProvider {
 /// Check whether the system looks like an E2B environment.
 pub fn detect() -> bool {
     Path::new(E2B_SANDBOXES_DIR).is_dir()
+}
+
+/// Discover running E2B sandboxes by listing subdirectories.
+pub fn discover_e2b_sandboxes(sandboxes_dir: &str) -> Result<Vec<crate::SandboxInfo>> {
+    let base = Path::new(sandboxes_dir);
+    if !base.is_dir() {
+        return Ok(vec![]);
+    }
+
+    let mut sandboxes = Vec::new();
+    for entry in std::fs::read_dir(base)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let sandbox_id = entry.file_name().to_string_lossy().to_string();
+
+        // Must have rootfs/ or snapshots/ subdirectory
+        let has_rootfs = entry.path().join("rootfs").is_dir();
+        let has_snapshots = entry.path().join("snapshots").is_dir();
+        if !has_rootfs && !has_snapshots {
+            continue;
+        }
+
+        sandboxes.push(crate::SandboxInfo {
+            sandbox_id: sandbox_id.clone(),
+            provider: Box::new(E2bProvider {
+                sandboxes_dir: sandboxes_dir.to_string(),
+                ..Default::default()
+            }),
+        });
+    }
+
+    Ok(sandboxes)
 }
 
 #[cfg(test)]

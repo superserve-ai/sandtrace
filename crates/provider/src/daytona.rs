@@ -153,6 +153,10 @@ impl SandboxProvider for DaytonaProvider {
         Ok(stream)
     }
 
+    fn discover(&self) -> Result<Vec<crate::SandboxInfo>> {
+        discover_daytona_workspaces(&self.workspaces_dir)
+    }
+
     fn name(&self) -> &str {
         "daytona"
     }
@@ -161,6 +165,40 @@ impl SandboxProvider for DaytonaProvider {
 /// Check whether the system looks like a Daytona environment.
 pub fn detect() -> bool {
     Path::new(DAYTONA_WORKSPACES_DIR).is_dir()
+}
+
+/// Discover running Daytona workspaces by listing subdirectories.
+pub fn discover_daytona_workspaces(workspaces_dir: &str) -> Result<Vec<crate::SandboxInfo>> {
+    let base = Path::new(workspaces_dir);
+    if !base.is_dir() {
+        return Ok(vec![]);
+    }
+
+    let mut sandboxes = Vec::new();
+    for entry in std::fs::read_dir(base)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let workspace_id = entry.file_name().to_string_lossy().to_string();
+
+        // Must have overlay/upper/ or workspace.json
+        let has_overlay = entry.path().join("overlay/upper").is_dir();
+        let has_meta = entry.path().join("workspace.json").is_file();
+        if !has_overlay && !has_meta {
+            continue;
+        }
+
+        sandboxes.push(crate::SandboxInfo {
+            sandbox_id: workspace_id.clone(),
+            provider: Box::new(DaytonaProvider {
+                workspaces_dir: workspaces_dir.to_string(),
+                ..Default::default()
+            }),
+        });
+    }
+
+    Ok(sandboxes)
 }
 
 #[cfg(test)]

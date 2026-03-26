@@ -26,9 +26,9 @@ struct Cli {
 enum Command {
     /// Watch a running sandbox and emit audit events in real time
     Watch {
-        /// Sandbox or VM identifier to attach to
+        /// Sandbox or VM identifier (omit to auto-discover all running VMs)
         #[arg(long)]
-        sandbox_id: String,
+        sandbox_id: Option<String>,
 
         /// Output target: file path, `-` for stdout, or `unix:///path` for Unix socket
         #[arg(short, long, default_value = "-")]
@@ -222,7 +222,7 @@ fn build_filter(
 }
 
 async fn cmd_watch(
-    sandbox_id: String,
+    sandbox_id: Option<String>,
     output: String,
     policy: Option<sandtrace_policy::PolicyManifest>,
     filter_type: Option<String>,
@@ -230,11 +230,7 @@ async fn cmd_watch(
     filter_verdict: Option<String>,
     no_validate: bool,
 ) -> Result<()> {
-    tracing::info!(sandbox_id, "attaching to sandbox");
-
     // Auto-detect schema version and create the appropriate evaluator.
-    // V2 policies use the stateful PolicyEngine (supports match/threshold/sequence).
-    // V1 policies use the legacy stateless evaluate() function.
     let mut engine = policy.as_ref().and_then(|p| {
         if p.is_v2() {
             tracing::info!(rules = p.rules.len(), "loaded v2 policy engine");
@@ -260,16 +256,39 @@ async fn cmd_watch(
 
     tracing::info!(output, "output pipeline ready");
 
-    // Auto-detect the sandbox provider and attach.
+    // Determine which sandboxes to watch.
     let provider = sandtrace_provider::detect::create_default_provider();
     let provider_name = provider.name().to_string();
     tracing::info!(provider = %provider_name, "detected provider");
+
+    let sandbox_infos: Vec<sandtrace_provider::SandboxInfo> = match sandbox_id {
+        Some(ref id) => {
+            tracing::info!(sandbox_id = %id, "single sandbox mode");
+            vec![sandtrace_provider::SandboxInfo {
+                sandbox_id: id.clone(),
+                provider,
+            }]
+        }
+        None => {
+            let discovered = sandtrace_provider::detect::discover_all()?;
+            if discovered.is_empty() {
+                anyhow::bail!(
+                    "no running sandboxes found for provider '{}'. \
+                     Use --sandbox-id to specify one explicitly.",
+                    provider_name
+                );
+            }
+            discovered
+        }
+    };
+
+    let sandbox_ids: Vec<String> = sandbox_infos.iter().map(|s| s.sandbox_id.clone()).collect();
+    let multi = sandbox_ids.len() > 1;
 
     // Convert captured events into hash-chained audit events, evaluate
     // policy on each, and emit through the output pipeline.
     let mut seq: u64 = 1;
     let mut prev_hash: Option<String> = None;
-    let mut event_count: u64 = 0;
 
     // Set up a shutdown flag triggered by SIGINT/SIGTERM.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -295,33 +314,46 @@ async fn cmd_watch(
         });
     }
 
-    // Start continuous streaming capture in a background thread.
+    // Spawn one capture thread per sandbox, all feeding the same channel.
     let (tx, rx) = std::sync::mpsc::channel();
-    let stream_shutdown = shutdown.clone();
-    let stream_sandbox_id = sandbox_id.clone();
 
-    let capture_handle = std::thread::Builder::new()
-        .name("sandtrace-capture".to_string())
-        .spawn(move || {
-            if let Err(e) = provider.attach_streaming(&stream_sandbox_id, tx, stream_shutdown) {
-                tracing::error!(error = %e, "capture failed");
-            }
-        })?;
+    let mut capture_handles = Vec::new();
+    for info in sandbox_infos {
+        let thread_tx = tx.clone();
+        let thread_shutdown = shutdown.clone();
+        let thread_sandbox_id = info.sandbox_id.clone();
+
+        let handle = std::thread::Builder::new()
+            .name(format!("sandtrace-{}", info.sandbox_id))
+            .spawn(move || {
+                if let Err(e) =
+                    info.provider
+                        .attach_streaming(&thread_sandbox_id, thread_tx, thread_shutdown)
+                {
+                    tracing::error!(
+                        sandbox_id = %thread_sandbox_id,
+                        error = %e,
+                        "capture failed"
+                    );
+                }
+            })?;
+        capture_handles.push(handle);
+    }
+    // Drop the original sender so the channel closes when all threads finish.
+    drop(tx);
 
     let policy_rules = policy.as_ref().map(|p| p.rules.len()).unwrap_or(0);
-    pretty::print_banner(&sandbox_id, &provider_name, policy_rules, &output);
+    pretty::print_banner(&sandbox_ids, &provider_name, policy_rules, &output);
 
     let mut stats = pretty::WatchStats::default();
 
-    // Process events as they arrive from the capture threads.
+    // Process events as they arrive from all capture threads.
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(captured) => {
                 let event_type_str = event_type_to_str(&captured.event_type);
                 let evidence_tier = evidence_tier_for(&captured.event_type);
 
-                // Evaluate policy if available. V2 policies use the stateful
-                // PolicyEngine; V1 policies use the legacy evaluate() function.
                 let verdict = if let Some(ref mut eng) = engine {
                     let tmp = sandtrace_audit_chain::build_event(
                         event_type_str,
@@ -364,10 +396,9 @@ async fn cmd_watch(
                 prev_hash = Some(audit_event.record_hash.clone());
                 seq += 1;
 
-                pretty::print_event(&audit_event);
+                pretty::print_event(&audit_event, multi);
                 stats.record(&audit_event);
                 stream.emit(&audit_event).await?;
-                event_count += 1;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -382,7 +413,9 @@ async fn cmd_watch(
         }
     }
 
-    let _ = capture_handle.join();
+    for handle in capture_handles {
+        let _ = handle.join();
+    }
     stream.flush().await?;
     stream.close().await?;
 
