@@ -458,29 +458,23 @@ impl SandboxTracker {
     }
 
     /// Spawn a capture thread for a sandbox and track it.
-    /// Uses a per-VM shutdown flag so individual VMs can be stopped.
+    /// Each VM gets its own shutdown flag for individual stop control.
     fn attach(
         &mut self,
         info: sandtrace_provider::SandboxInfo,
         tx: std::sync::mpsc::Sender<sandtrace_capture::CapturedEvent>,
-        global_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _global_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         let sandbox_id = info.sandbox_id.clone();
         let vm_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_shutdown = vm_shutdown.clone();
-        let thread_global = global_shutdown;
 
         let handle = std::thread::Builder::new()
             .name(format!("st-{}", sandbox_id))
             .spawn(move || {
-                // Create a combined shutdown: stop if either per-VM or global flag is set.
-                let combined = CombinedShutdown {
-                    vm: thread_shutdown,
-                    global: thread_global,
-                };
                 if let Err(e) =
                     info.provider
-                        .attach_streaming(&info.sandbox_id, tx, combined.as_flag())
+                        .attach_streaming(&info.sandbox_id, tx, thread_shutdown)
                 {
                     tracing::error!(
                         sandbox_id = %info.sandbox_id,
@@ -546,37 +540,6 @@ impl SandboxTracker {
     }
 }
 
-/// Combines per-VM and global shutdown flags into one AtomicBool.
-/// A background thread polls both and sets a combined flag.
-struct CombinedShutdown {
-    vm: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    global: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl CombinedShutdown {
-    /// Create a single AtomicBool that becomes true when either flag is set.
-    fn as_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        let combined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let c = combined.clone();
-        let vm = self.vm.clone();
-        let global = self.global.clone();
-        std::thread::Builder::new()
-            .name("st-shutdown-mon".to_string())
-            .spawn(move || {
-                loop {
-                    if vm.load(std::sync::atomic::Ordering::Relaxed)
-                        || global.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        c.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            })
-            .ok();
-        combined
-    }
-}
 
 /// Map `EventType` enum to its snake_case string representation.
 fn event_type_to_str(et: &sandtrace_capture::EventType) -> &'static str {

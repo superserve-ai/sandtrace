@@ -245,17 +245,24 @@ pub struct EgressInfo {
 
 // ── DNS sniffing ─────────────────────────────────────────────────────
 
+/// Maximum DNS cache entries. Evicts oldest when full.
+const MAX_DNS_CACHE_ENTRIES: usize = 10_000;
+
 /// Passive DNS cache built by sniffing DNS response packets on the tap.
 /// Maps IP addresses to hostnames observed in DNS A/AAAA responses.
+/// Bounded to prevent unbounded memory growth.
 pub struct DnsCache {
     /// IP → hostname mapping. Most recent answer wins.
     names: HashMap<IpAddr, String>,
+    /// Insertion order for LRU eviction.
+    order: Vec<IpAddr>,
 }
 
 impl DnsCache {
     pub fn new() -> Self {
         Self {
             names: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -277,6 +284,21 @@ impl DnsCache {
             return;
         }
         self.parse_dns_response(transport_payload);
+    }
+
+    /// Insert a mapping, evicting the oldest entry if at capacity.
+    fn insert(&mut self, ip: IpAddr, name: String) {
+        if !self.names.contains_key(&ip) && self.names.len() >= MAX_DNS_CACHE_ENTRIES {
+            // Evict oldest entry.
+            if let Some(oldest) = self.order.first().cloned() {
+                self.names.remove(&oldest);
+                self.order.remove(0);
+            }
+        }
+        if !self.names.contains_key(&ip) {
+            self.order.push(ip);
+        }
+        self.names.insert(ip, name);
     }
 
     /// Resolve an IP address to a hostname if known.
@@ -356,14 +378,14 @@ impl DnsCache {
                         let ip = IpAddr::V4(Ipv4Addr::new(
                             data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
                         ));
-                        self.names.insert(ip, name.clone());
+                        self.insert(ip, name.clone());
                     }
                     28 if rdlength == 16 => {
                         // AAAA record — IPv6
                         let mut bytes = [0u8; 16];
                         bytes.copy_from_slice(&data[pos..pos + 16]);
                         let ip = IpAddr::V6(std::net::Ipv6Addr::from(bytes));
-                        self.names.insert(ip, name.clone());
+                        self.insert(ip, name.clone());
                     }
                     _ => {}
                 }
@@ -797,7 +819,7 @@ mod tests {
     fn dns_cache_enriches_dest_host() {
         let mut dns = DnsCache::new();
         let ip = IpAddr::V4(Ipv4Addr::new(104, 16, 0, 1));
-        dns.names.insert(ip, "api.stripe.com".to_string());
+        dns.insert(ip, "api.stripe.com".to_string());
 
         let mut tracker = ConnectionTracker::new();
         tracker.record_packet(&ParsedPacket {
