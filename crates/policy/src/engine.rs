@@ -1,4 +1,4 @@
-//! Stateful v2 evaluation engine for match, threshold, and sequence rules.
+//! Stateful evaluation engine for all policy rule types.
 //!
 //! The engine maintains per-rule state (event buffers for threshold rules,
 //! partial-match trackers for sequence rules) and evaluates events in
@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sandtrace_audit_chain::{AuditEvent, Verdict};
 
 use crate::{
-    FieldPredicate, PolicyManifest, PolicyMode, PolicyRule, RuleAction, ThresholdMetric,
+    FieldPredicate, PolicyManifest, PolicyRule, RuleAction, ThresholdMetric,
 };
 
 // ---------------------------------------------------------------------------
@@ -365,7 +365,6 @@ impl PolicyEngine {
     /// and sequence) update their internal state on every call.
     pub fn evaluate(&mut self, event: &AuditEvent) -> Verdict {
         let now = parse_wall_time(&event.wall_time).unwrap_or_else(Utc::now);
-        let global_mode = self.policy.effective_mode();
 
         // Collect rule evaluation results. We iterate by index to avoid
         // borrowing self.policy while also needing &mut self for stateful rules.
@@ -397,8 +396,7 @@ impl PolicyEngine {
             };
 
             if let Some(verdict) = raw_verdict {
-                let rule = &self.policy.rules[rule_idx];
-                return apply_mode(verdict, rule, global_mode);
+                return verdict;
             }
 
             // Handle stateful rules separately to satisfy borrow checker
@@ -484,13 +482,12 @@ impl PolicyEngine {
             };
 
             if let Some(verdict) = stateful_verdict {
-                let rule = &self.policy.rules[rule_idx];
-                return apply_mode(verdict, rule, global_mode);
+                return verdict;
             }
         }
 
         // No rule matched — default verdict
-        default_verdict(event, global_mode, &self.policy)
+        default_verdict(event, &self.policy)
     }
 
 }
@@ -673,27 +670,8 @@ fn evaluate_match_rule(event: &AuditEvent, rule: &PolicyRule) -> Option<Verdict>
         None
     }
 
-fn apply_mode(verdict: Verdict, rule: &PolicyRule, global_mode: PolicyMode) -> Verdict {
-    let effective_mode = rule.mode().unwrap_or(global_mode);
-    match effective_mode {
-        PolicyMode::Audit => {
-            if verdict.result == "deny" {
-                Verdict {
-                    result: "allow".to_string(),
-                    policy_rule: verdict.policy_rule,
-                    reason: format!("[audit] {}", verdict.reason),
-                }
-            } else {
-                verdict
-            }
-        }
-        PolicyMode::Enforce => verdict,
-    }
-}
-
 fn default_verdict(
     event: &AuditEvent,
-    global_mode: PolicyMode,
     policy: &PolicyManifest,
 ) -> Verdict {
     // Only deny by default if there are allowlist-style rules (NetworkEgress /
@@ -713,16 +691,9 @@ fn default_verdict(
         _ => false,
     };
 
-    let result = if has_allowlist_rules {
-        match global_mode {
-            PolicyMode::Enforce => "deny",
-            PolicyMode::Audit => "allow",
-        }
-    } else {
-        "allow"
-    };
+    let result = if has_allowlist_rules { "deny" } else { "allow" };
 
-    let reason = if has_allowlist_rules && result == "deny" {
+    let reason = if has_allowlist_rules {
         format!("no rule permits event type '{}'", event.event_type)
     } else {
         format!("no rule matched event type '{}'", event.event_type)
@@ -766,7 +737,7 @@ mod tests {
 
     fn make_event(event_type: &str, payload: serde_json::Value) -> AuditEvent {
         AuditEvent {
-            schema_version: "2.0".into(),
+            schema_version: "1.0".into(),
             event_id: "e1".into(),
             event_type: event_type.into(),
             agent_id: "a1".into(),
@@ -870,7 +841,6 @@ mod tests {
     #[test]
     fn test_match_rule_deny() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -900,7 +870,6 @@ rules:
     #[test]
     fn test_match_rule_no_match() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -928,7 +897,6 @@ rules:
     #[test]
     fn test_match_rule_glob_predicate() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:wildcard
     type: match
@@ -952,7 +920,6 @@ rules:
     #[test]
     fn test_match_first_match_order() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:evil
     type: match
@@ -996,7 +963,6 @@ rules:
     #[test]
     fn test_threshold_count() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:calls
     type: threshold
@@ -1035,7 +1001,6 @@ rules:
     #[test]
     fn test_threshold_sum() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:bytes
     type: threshold
@@ -1070,7 +1035,6 @@ rules:
     #[test]
     fn test_threshold_window_expiry() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:calls
     type: threshold
@@ -1108,7 +1072,6 @@ rules:
     #[test]
     fn test_sequence_fires() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil
     type: sequence
@@ -1148,7 +1111,6 @@ rules:
     #[test]
     fn test_sequence_window_expired() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil
     type: sequence
@@ -1186,7 +1148,6 @@ rules:
     #[test]
     fn test_sequence_resets_after_fire() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil
     type: sequence
@@ -1226,7 +1187,6 @@ rules:
     #[test]
     fn test_sequence_three_steps() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:three-step
     type: sequence
@@ -1256,98 +1216,12 @@ rules:
     }
 
     // -------------------------------------------------------------------
-    // Audit mode
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_audit_mode_global() {
-        let yaml = r#"
-schema_version: "2.0"
-mode: audit
-rules:
-  - id: deny:evil
-    type: match
-    action: deny
-    match:
-      dest_host:
-        equals: evil.com
-"#;
-        let policy = crate::load_policy(yaml).unwrap();
-        let mut engine = PolicyEngine::new(policy);
-
-        let event = make_event(
-            "network_egress",
-            serde_json::json!({"dest_host": "evil.com"}),
-        );
-        let verdict = engine.evaluate(&event);
-        // Audit mode: deny becomes allow with [audit] prefix
-        assert_eq!(verdict.result, "allow");
-        assert!(verdict.reason.starts_with("[audit]"));
-        assert_eq!(verdict.policy_rule, "deny:evil");
-    }
-
-    #[test]
-    fn test_enforce_mode_per_rule_override() {
-        let yaml = r#"
-schema_version: "2.0"
-mode: audit
-rules:
-  - id: deny:evil
-    type: match
-    action: deny
-    mode: enforce
-    match:
-      dest_host:
-        equals: evil.com
-"#;
-        let policy = crate::load_policy(yaml).unwrap();
-        let mut engine = PolicyEngine::new(policy);
-
-        let event = make_event(
-            "network_egress",
-            serde_json::json!({"dest_host": "evil.com"}),
-        );
-        let verdict = engine.evaluate(&event);
-        // Per-rule enforce overrides global audit
-        assert_eq!(verdict.result, "deny");
-        assert!(!verdict.reason.starts_with("[audit]"));
-    }
-
-    #[test]
-    fn test_audit_mode_per_rule() {
-        let yaml = r#"
-schema_version: "2.0"
-mode: enforce
-rules:
-  - id: deny:evil
-    type: match
-    action: deny
-    mode: audit
-    match:
-      dest_host:
-        equals: evil.com
-"#;
-        let policy = crate::load_policy(yaml).unwrap();
-        let mut engine = PolicyEngine::new(policy);
-
-        let event = make_event(
-            "network_egress",
-            serde_json::json!({"dest_host": "evil.com"}),
-        );
-        let verdict = engine.evaluate(&event);
-        // Per-rule audit: deny becomes allow
-        assert_eq!(verdict.result, "allow");
-        assert!(verdict.reason.starts_with("[audit]"));
-    }
-
-    // -------------------------------------------------------------------
     // Network/filesystem through engine
     // -------------------------------------------------------------------
 
     #[test]
     fn test_engine_network_allow() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1370,7 +1244,6 @@ rules:
     #[test]
     fn test_engine_network_deny_no_match() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1392,7 +1265,6 @@ rules:
     #[test]
     fn test_engine_filesystem() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: fs:workspace
     type: filesystem
@@ -1421,7 +1293,6 @@ rules:
     #[test]
     fn test_mixed_rules_first_match() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -1468,8 +1339,6 @@ rules:
         // Reproduce bug st-0o7: filesystem rule with match/sequence/threshold
         // before it should still evaluate correctly.
         let yaml = r#"
-schema_version: "2.0"
-mode: enforce
 rules:
   - id: deny:unknown-egress
     type: match
@@ -1553,8 +1422,6 @@ rules:
     #[test]
     fn test_engine_filesystem_readonly_denies_writes() {
         let yaml = r#"
-schema_version: "2.0"
-mode: enforce
 rules:
   - id: fs:readonly
     type: filesystem
@@ -1607,8 +1474,6 @@ rules:
     #[test]
     fn test_engine_filesystem_readwrite_denies_deletes() {
         let yaml = r#"
-schema_version: "2.0"
-mode: enforce
 rules:
   - id: fs:workspace
     type: filesystem
@@ -1650,8 +1515,6 @@ rules:
     #[test]
     fn test_engine_filesystem_full_allows_all() {
         let yaml = r#"
-schema_version: "2.0"
-mode: enforce
 rules:
   - id: fs:full
     type: filesystem
@@ -1681,8 +1544,6 @@ rules:
         // Regression: v2 should allow filesystem_summary with no file paths
         // (consistent with v1 behavior), not fall through to default deny.
         let yaml = r#"
-schema_version: "2.0"
-mode: enforce
 rules:
   - id: fs:workspace
     type: filesystem
@@ -1711,8 +1572,6 @@ rules:
     #[test]
     fn test_unknown_event_type_in_enforce() {
         let yaml = r#"
-schema_version: "2.0"
-mode: enforce
 rules: []
 "#;
         let policy = crate::load_policy(yaml).unwrap();

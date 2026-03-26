@@ -1,10 +1,7 @@
-# Sandtrace policy manifest (v2)
+# Sandtrace policy manifest
 # Declares permitted behavior for AI agent sandboxes.
 # Rules are evaluated in first-match order: the first matching rule determines
 # the verdict. This enables deny-before-allow patterns.
-
-schema_version: "2.0"
-mode: enforce
 
 rules:
   # Deny exfiltration to unknown hosts (first-match: deny before allow)

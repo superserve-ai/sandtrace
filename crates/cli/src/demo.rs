@@ -22,7 +22,6 @@ pub fn run(scenario: &str) -> Result<()> {
 fn demo_policy() -> PolicyManifest {
     sandtrace_policy::load_policy(
         r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: tool:stripe_charge
