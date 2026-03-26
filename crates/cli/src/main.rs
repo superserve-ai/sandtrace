@@ -305,7 +305,16 @@ async fn cmd_watch(
         };
         tracker.attach(info, capture_tx.clone(), shutdown.clone())?;
     } else {
-        // Auto-discovery mode: start lifecycle watcher in a background thread.
+        // Initial discovery: synchronous, so the banner shows correct count.
+        let initial = provider.discover().unwrap_or_default();
+        for info in initial {
+            pretty::print_attach(&info.sandbox_id);
+            if let Err(e) = tracker.attach(info, capture_tx.clone(), shutdown.clone()) {
+                tracing::warn!(error = %e, "failed to attach");
+            }
+        }
+
+        // Start lifecycle watcher for future changes (new VMs, dead VMs).
         let lc_shutdown = shutdown.clone();
         std::thread::Builder::new()
             .name("sandtrace-lifecycle".to_string())
@@ -317,26 +326,6 @@ async fn cmd_watch(
     }
 
     let policy_rules = policy.as_ref().map(|p| p.rules.len()).unwrap_or(0);
-
-    // Wait briefly for initial discovery before printing banner.
-    if !single_mode {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        // Process initial lifecycle events.
-        while let Ok(event) = lifecycle_rx.try_recv() {
-            match event {
-                sandtrace_provider::LifecycleEvent::Attached(info) => {
-                    pretty::print_attach(&info.sandbox_id);
-                    if let Err(e) = tracker.attach(info, capture_tx.clone(), shutdown.clone()) {
-                        tracing::warn!(error = %e, "failed to attach");
-                    }
-                }
-                sandtrace_provider::LifecycleEvent::Detached { sandbox_id } => {
-                    pretty::print_detach(&sandbox_id);
-                    tracker.remove(&sandbox_id);
-                }
-            }
-        }
-    }
 
     pretty::print_banner(&tracker.active_ids(), &provider_name, policy_rules, &output);
 
