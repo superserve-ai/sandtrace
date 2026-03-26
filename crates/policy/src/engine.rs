@@ -540,25 +540,88 @@ fn evaluate_network_rule(event: &AuditEvent, rule: &PolicyRule) -> Option<Verdic
 
 fn evaluate_filesystem_rule(event: &AuditEvent, rule: &PolicyRule) -> Option<Verdict> {
         if let PolicyRule::Filesystem {
-            id, paths, action, ..
+            id, paths, action, access, ..
         } = rule
         {
-            let mut all_paths: Vec<&str> = Vec::new();
-            for key in &["files_created", "files_modified", "files_deleted"] {
-                if let Some(arr) = event.payload.get(*key).and_then(|v| v.as_array()) {
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            all_paths.push(s);
-                        }
+            // Collect paths from each operation category.
+            let mut created: Vec<&str> = Vec::new();
+            let mut modified: Vec<&str> = Vec::new();
+            let mut deleted: Vec<&str> = Vec::new();
+
+            if let Some(arr) = event.payload.get("files_created").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        created.push(s);
                     }
                 }
             }
-            if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
-                all_paths.push(path);
+            if let Some(arr) = event.payload.get("files_modified").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        modified.push(s);
+                    }
+                }
+            }
+            if let Some(arr) = event.payload.get("files_deleted").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        deleted.push(s);
+                    }
+                }
+            }
+
+            // Also check "path" field for single-file events (treated as read/modify).
+            let single_path = event.payload.get("path").and_then(|v| v.as_str());
+
+            // Enforce access preset: deny operations not permitted by the preset.
+            if let Some(preset) = access {
+                match preset {
+                    crate::AccessPreset::ReadOnly => {
+                        // Read-only: deny any write or delete operations.
+                        if !created.is_empty() || !modified.is_empty() || !deleted.is_empty() {
+                            return Some(Verdict {
+                                result: "deny".to_string(),
+                                policy_rule: id.clone(),
+                                reason: format!(
+                                    "access preset read-only denies write/delete operations"
+                                ),
+                            });
+                        }
+                    }
+                    crate::AccessPreset::ReadWrite => {
+                        // Read-write: deny delete operations.
+                        if !deleted.is_empty() {
+                            return Some(Verdict {
+                                result: "deny".to_string(),
+                                policy_rule: id.clone(),
+                                reason: format!(
+                                    "access preset read-write denies delete operations"
+                                ),
+                            });
+                        }
+                    }
+                    crate::AccessPreset::Full => {
+                        // Full: all operations permitted, no restriction.
+                    }
+                }
+            }
+
+            // Gather all paths for allowlist checking.
+            let mut all_paths: Vec<&str> = Vec::new();
+            all_paths.extend(&created);
+            all_paths.extend(&modified);
+            all_paths.extend(&deleted);
+            if let Some(p) = single_path {
+                all_paths.push(p);
             }
 
             if all_paths.is_empty() {
-                return None;
+                // No file paths to check — allow (consistent with v1 behavior).
+                return Some(Verdict {
+                    result: action_to_result(*action),
+                    policy_rule: id.clone(),
+                    reason: "no file paths in event".to_string(),
+                });
             }
 
             let all_covered = all_paths.iter().all(|p| {
@@ -1399,6 +1462,251 @@ rules:
     // -------------------------------------------------------------------
     // Default verdict for unknown event types
     // -------------------------------------------------------------------
+
+    #[test]
+    fn test_engine_filesystem_with_full_policy() {
+        // Reproduce bug st-0o7: filesystem rule with match/sequence/threshold
+        // before it should still evaluate correctly.
+        let yaml = r#"
+schema_version: "2.0"
+mode: enforce
+rules:
+  - id: deny:unknown-egress
+    type: match
+    action: deny
+    match:
+      event_type:
+        equals: network_egress
+      dest_host:
+        not_in:
+          - api.stripe.com
+          - api.openai.com
+  - id: seq:exfil-pattern
+    type: sequence
+    action: deny
+    sequence:
+      window: 10m
+      steps:
+        - event_type:
+            equals: filesystem_summary
+          path:
+            glob: "/home/agent/credentials*"
+        - event_type:
+            equals: network_egress
+  - id: rate:api-calls
+    type: threshold
+    action: deny
+    threshold:
+      metric: count
+      window: 5m
+      limit: 100.0
+  - id: fs:workspace
+    type: filesystem
+    access: read-write
+    paths:
+      - /home/agent/**
+      - /tmp/**
+  - id: tool:stripe_charge
+    type: network_egress
+    destinations:
+      - host: api.stripe.com
+        port: 443
+    max_bytes_per_call: 4096
+"#;
+        let policy = crate::load_policy(yaml).unwrap();
+        let mut engine = PolicyEngine::new(policy);
+
+        // Filesystem event with paths inside allowed workspace
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": ["/home/agent/output.txt"],
+                "files_modified": ["/tmp/scratch.log"],
+                "files_deleted": []
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(
+            verdict.result, "allow",
+            "filesystem event within allowed paths should be allowed, got: {:?}",
+            verdict
+        );
+        assert_eq!(verdict.policy_rule, "fs:workspace");
+
+        // Filesystem event with path OUTSIDE allowed workspace should deny
+        let bad_event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": ["/etc/shadow"],
+                "files_modified": [],
+                "files_deleted": []
+            }),
+        );
+        let bad_verdict = engine.evaluate(&bad_event);
+        assert_eq!(
+            bad_verdict.result, "deny",
+            "filesystem event outside allowed paths should be denied, got: {:?}",
+            bad_verdict
+        );
+    }
+
+    #[test]
+    fn test_engine_filesystem_readonly_denies_writes() {
+        let yaml = r#"
+schema_version: "2.0"
+mode: enforce
+rules:
+  - id: fs:readonly
+    type: filesystem
+    access: read-only
+    paths:
+      - /home/agent/**
+"#;
+        let policy = crate::load_policy(yaml).unwrap();
+        let mut engine = PolicyEngine::new(policy);
+
+        // Read-only: file creation should be denied
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": ["/home/agent/new.txt"],
+                "files_modified": [],
+                "files_deleted": []
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(verdict.result, "deny");
+        assert!(verdict.reason.contains("read-only"));
+
+        // Read-only: file modification should be denied
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": [],
+                "files_modified": ["/home/agent/existing.txt"],
+                "files_deleted": []
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(verdict.result, "deny");
+
+        // Read-only: read (path only) should be allowed
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": [],
+                "files_modified": [],
+                "files_deleted": [],
+                "path": "/home/agent/data.txt"
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(verdict.result, "allow");
+    }
+
+    #[test]
+    fn test_engine_filesystem_readwrite_denies_deletes() {
+        let yaml = r#"
+schema_version: "2.0"
+mode: enforce
+rules:
+  - id: fs:workspace
+    type: filesystem
+    access: read-write
+    paths:
+      - /home/agent/**
+      - /tmp/**
+"#;
+        let policy = crate::load_policy(yaml).unwrap();
+        let mut engine = PolicyEngine::new(policy);
+
+        // Read-write: creates and modifies should be allowed
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": ["/home/agent/new.txt"],
+                "files_modified": ["/tmp/scratch.log"],
+                "files_deleted": []
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(verdict.result, "allow");
+        assert_eq!(verdict.policy_rule, "fs:workspace");
+
+        // Read-write: deletes should be denied
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": [],
+                "files_modified": [],
+                "files_deleted": ["/home/agent/important.txt"]
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(verdict.result, "deny");
+        assert!(verdict.reason.contains("read-write"));
+    }
+
+    #[test]
+    fn test_engine_filesystem_full_allows_all() {
+        let yaml = r#"
+schema_version: "2.0"
+mode: enforce
+rules:
+  - id: fs:full
+    type: filesystem
+    access: full
+    paths:
+      - /opt/app/**
+"#;
+        let policy = crate::load_policy(yaml).unwrap();
+        let mut engine = PolicyEngine::new(policy);
+
+        // Full access: all operations allowed
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": ["/opt/app/new.bin"],
+                "files_modified": ["/opt/app/config.json"],
+                "files_deleted": ["/opt/app/old.log"]
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(verdict.result, "allow");
+        assert_eq!(verdict.policy_rule, "fs:full");
+    }
+
+    #[test]
+    fn test_engine_filesystem_empty_paths_allows() {
+        // Regression: v2 should allow filesystem_summary with no file paths
+        // (consistent with v1 behavior), not fall through to default deny.
+        let yaml = r#"
+schema_version: "2.0"
+mode: enforce
+rules:
+  - id: fs:workspace
+    type: filesystem
+    paths:
+      - /home/agent/**
+"#;
+        let policy = crate::load_policy(yaml).unwrap();
+        let mut engine = PolicyEngine::new(policy);
+
+        let event = make_event(
+            "filesystem_summary",
+            serde_json::json!({
+                "files_created": [],
+                "files_modified": [],
+                "files_deleted": []
+            }),
+        );
+        let verdict = engine.evaluate(&event);
+        assert_eq!(
+            verdict.result, "allow",
+            "empty filesystem event should be allowed, got: {:?}",
+            verdict
+        );
+    }
 
     #[test]
     fn test_unknown_event_type_in_enforce() {

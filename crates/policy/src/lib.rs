@@ -532,21 +532,74 @@ fn evaluate_filesystem(event: &AuditEvent, policy: &PolicyManifest) -> Verdict {
         };
     }
 
-    // Collect all file paths from the event payload
-    let mut all_paths: Vec<&str> = Vec::new();
-    for key in &["files_created", "files_modified", "files_deleted"] {
-        if let Some(arr) = event.payload.get(*key).and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    all_paths.push(s);
-                }
+    // Collect paths per operation category for access preset enforcement.
+    let mut created: Vec<&str> = Vec::new();
+    let mut modified: Vec<&str> = Vec::new();
+    let mut deleted: Vec<&str> = Vec::new();
+
+    if let Some(arr) = event.payload.get("files_created").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                created.push(s);
+            }
+        }
+    }
+    if let Some(arr) = event.payload.get("files_modified").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                modified.push(s);
+            }
+        }
+    }
+    if let Some(arr) = event.payload.get("files_deleted").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                deleted.push(s);
             }
         }
     }
 
     // Also check "path" field for single-file events
-    if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
-        all_paths.push(path);
+    let single_path = event.payload.get("path").and_then(|v| v.as_str());
+
+    // Enforce access presets: check if any rule denies the operation types.
+    for rule in &fs_rules {
+        if let PolicyRule::Filesystem { id, access, .. } = rule {
+            if let Some(preset) = access {
+                match preset {
+                    AccessPreset::ReadOnly => {
+                        if !created.is_empty() || !modified.is_empty() || !deleted.is_empty() {
+                            return Verdict {
+                                result: "deny".to_string(),
+                                policy_rule: id.to_string(),
+                                reason: "access preset read-only denies write/delete operations"
+                                    .to_string(),
+                            };
+                        }
+                    }
+                    AccessPreset::ReadWrite => {
+                        if !deleted.is_empty() {
+                            return Verdict {
+                                result: "deny".to_string(),
+                                policy_rule: id.to_string(),
+                                reason: "access preset read-write denies delete operations"
+                                    .to_string(),
+                            };
+                        }
+                    }
+                    AccessPreset::Full => {}
+                }
+            }
+        }
+    }
+
+    // Gather all paths for allowlist checking.
+    let mut all_paths: Vec<&str> = Vec::new();
+    all_paths.extend(&created);
+    all_paths.extend(&modified);
+    all_paths.extend(&deleted);
+    if let Some(p) = single_path {
+        all_paths.push(p);
     }
 
     if all_paths.is_empty() {
