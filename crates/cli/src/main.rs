@@ -339,9 +339,11 @@ async fn cmd_watch(
         while let Ok(event) = lifecycle_rx.try_recv() {
             match event {
                 sandtrace_provider::LifecycleEvent::Attached(info) => {
-                    pretty::print_attach(&info.sandbox_id);
-                    if let Err(e) = tracker.attach(info, capture_tx.clone(), shutdown.clone()) {
-                        tracing::warn!(error = %e, "failed to attach to new sandbox");
+                    let id = info.sandbox_id.clone();
+                    match tracker.attach(info, capture_tx.clone(), shutdown.clone()) {
+                        Ok(true) => pretty::print_attach(&id),
+                        Ok(false) => {} // Already tracked, skip.
+                        Err(e) => tracing::warn!(error = %e, "failed to attach"),
                     }
                 }
                 sandtrace_provider::LifecycleEvent::Detached { sandbox_id } => {
@@ -447,13 +449,17 @@ impl SandboxTracker {
     }
 
     /// Spawn a capture thread for a sandbox and track it.
-    /// Each VM gets its own shutdown flag for individual stop control.
+    /// Returns false if the sandbox is already being tracked (dedup).
     fn attach(
         &mut self,
         info: sandtrace_provider::SandboxInfo,
         tx: std::sync::mpsc::Sender<sandtrace_capture::CapturedEvent>,
         _global_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self.active.contains_key(&info.sandbox_id) {
+            return Ok(false);
+        }
+
         let sandbox_id = info.sandbox_id.clone();
         let vm_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_shutdown = vm_shutdown.clone();
@@ -479,7 +485,7 @@ impl SandboxTracker {
                 shutdown: vm_shutdown,
             },
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Check for finished threads and remove them. Returns detached sandbox IDs.

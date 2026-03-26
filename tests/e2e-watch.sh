@@ -118,6 +118,7 @@ sleep 15
 check "sandtrace is running" "kill -0 $ST_PID 2>/dev/null"
 check "vm-alpha attached" "grep -q 'vm-alpha' $WORKDIR/watch.log"
 check "vm-beta attached" "grep -q 'vm-beta' $WORKDIR/watch.log"
+check "banner shows 2 sandboxes" "grep -q 'sandboxes: 2' $WORKDIR/watch.log"
 
 # ---------------------------------------------------------------------------
 # Test 2: Generate filesystem events, verify capture

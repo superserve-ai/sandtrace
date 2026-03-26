@@ -254,15 +254,15 @@ const MAX_DNS_CACHE_ENTRIES: usize = 10_000;
 pub struct DnsCache {
     /// IP → hostname mapping. Most recent answer wins.
     names: HashMap<IpAddr, String>,
-    /// Insertion order for LRU eviction.
-    order: Vec<IpAddr>,
+    /// Insertion order for FIFO eviction (O(1) front removal).
+    order: std::collections::VecDeque<IpAddr>,
 }
 
 impl DnsCache {
     pub fn new() -> Self {
         Self {
             names: HashMap::new(),
-            order: Vec::new(),
+            order: std::collections::VecDeque::new(),
         }
     }
 
@@ -289,14 +289,12 @@ impl DnsCache {
     /// Insert a mapping, evicting the oldest entry if at capacity.
     fn insert(&mut self, ip: IpAddr, name: String) {
         if !self.names.contains_key(&ip) && self.names.len() >= MAX_DNS_CACHE_ENTRIES {
-            // Evict oldest entry.
-            if let Some(oldest) = self.order.first().cloned() {
+            if let Some(oldest) = self.order.pop_front() {
                 self.names.remove(&oldest);
-                self.order.remove(0);
             }
         }
         if !self.names.contains_key(&ip) {
-            self.order.push(ip);
+            self.order.push_back(ip);
         }
         self.names.insert(ip, name);
     }
