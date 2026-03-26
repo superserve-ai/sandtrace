@@ -126,7 +126,7 @@ fn run_stripe_exfil() -> Result<()> {
     std::fs::remove_file(&trail).ok();
     let mut chain = AuditChain::open(&trail)?;
 
-    let agent_id = "demo-billing-agent";
+    let sandbox_id = "demo-billing-agent";
     let trace_id = "demo-trace-001";
 
     // -- Step 1: Agent reads credentials.json (file access to sensitive path)
@@ -143,7 +143,7 @@ fn run_stripe_exfil() -> Result<()> {
     );
     let e1 = chain.append(
         "filesystem_summary",
-        agent_id,
+        sandbox_id,
         trace_id,
         "hypervisor",
         fs_payload,
@@ -167,7 +167,7 @@ fn run_stripe_exfil() -> Result<()> {
     );
     let e2 = chain.append(
         "network_egress",
-        agent_id,
+        sandbox_id,
         trace_id,
         "hypervisor",
         legit_payload,
@@ -197,7 +197,7 @@ fn run_stripe_exfil() -> Result<()> {
     );
     let e3 = chain.append(
         "network_egress",
-        agent_id,
+        sandbox_id,
         trace_id,
         "hypervisor",
         exfil_payload,
@@ -218,7 +218,7 @@ fn run_stripe_exfil() -> Result<()> {
     );
     let e4 = chain.append(
         "filesystem_summary",
-        agent_id,
+        sandbox_id,
         trace_id,
         "hypervisor",
         write_payload,
@@ -251,7 +251,7 @@ fn run_persist() -> Result<()> {
     std::fs::remove_file(&trail).ok();
     let mut chain = AuditChain::open(&trail)?;
 
-    let agent_id = "demo-billing-agent";
+    let sandbox_id = "demo-billing-agent";
 
     // ---- Session 1 ----
     let trace_s1 = "demo-trace-s1";
@@ -272,7 +272,7 @@ fn run_persist() -> Result<()> {
     );
     let e1 = chain.append(
         "filesystem_summary",
-        agent_id,
+        sandbox_id,
         trace_s1,
         "hypervisor",
         read_payload,
@@ -293,7 +293,7 @@ fn run_persist() -> Result<()> {
     );
     let e2 = chain.append(
         "filesystem_summary",
-        agent_id,
+        sandbox_id,
         trace_s1,
         "hypervisor",
         memory_payload,
@@ -315,7 +315,7 @@ fn run_persist() -> Result<()> {
     );
     let e3 = chain.append(
         "network_egress",
-        agent_id,
+        sandbox_id,
         trace_s1,
         "hypervisor",
         legit_payload,
@@ -343,7 +343,7 @@ fn run_persist() -> Result<()> {
     );
     let e4 = chain.append(
         "filesystem_summary",
-        agent_id,
+        sandbox_id,
         trace_s2,
         "hypervisor",
         read_mem_payload,
@@ -365,7 +365,7 @@ fn run_persist() -> Result<()> {
     );
     let e5 = chain.append(
         "filesystem_summary",
-        agent_id,
+        sandbox_id,
         trace_s2,
         "hypervisor",
         read_creds,
@@ -393,7 +393,7 @@ fn run_persist() -> Result<()> {
     );
     let e6 = chain.append(
         "network_egress",
-        agent_id,
+        sandbox_id,
         trace_s2,
         "hypervisor",
         exfil_payload,
@@ -419,7 +419,7 @@ fn stub_event(event_type: &str, payload: &serde_json::Value) -> sandtrace_audit_
         schema_version: "2.0".into(),
         event_id: "eval".into(),
         event_type: event_type.into(),
-        agent_id: String::new(),
+        sandbox_id: String::new(),
         trace_id: String::new(),
         seq: 0,
         prev_hash: None,

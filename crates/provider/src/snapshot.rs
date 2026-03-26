@@ -44,7 +44,7 @@ impl SandboxProvider for SnapshotProvider {
         let (tx, stream) = CaptureStream::channel();
 
         let config = FsTrackingConfig {
-            agent_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
             trace_id: uuid::Uuid::new_v4().to_string(),
             method: FsTrackingMethod::SnapshotDiff {
                 before: PathBuf::from(&self.before_dir),

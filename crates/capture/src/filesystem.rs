@@ -28,7 +28,7 @@ use crate::{CapturedEvent, EventType};
 #[derive(Debug, Clone)]
 pub struct FsTrackingConfig {
     /// Agent identifier for event attribution.
-    pub agent_id: String,
+    pub sandbox_id: String,
     /// Trace identifier for this capture session.
     pub trace_id: String,
     /// Which tracking method to use.
@@ -71,10 +71,10 @@ pub struct FsSummary {
 }
 
 impl FsSummary {
-    pub fn to_event(&self, agent_id: &str, trace_id: &str) -> CapturedEvent {
+    pub fn to_event(&self, sandbox_id: &str, trace_id: &str) -> CapturedEvent {
         CapturedEvent::new(
             EventType::FilesystemSummary,
-            agent_id,
+            sandbox_id,
             trace_id,
             serde_json::to_value(self).expect("FsSummary is always serializable"),
         )
@@ -114,7 +114,7 @@ pub fn capture_fs_changes(config: &FsTrackingConfig) -> Result<Vec<CapturedEvent
         "filesystem changes captured"
     );
 
-    Ok(vec![summary.to_event(&config.agent_id, &config.trace_id)])
+    Ok(vec![summary.to_event(&config.sandbox_id, &config.trace_id)])
 }
 
 /// Continuously watches filesystem changes and sends events through a channel.
@@ -144,7 +144,7 @@ pub fn watch_fs_changes(
                             "using inotify for filesystem watching"
                         );
                         if let Err(e) = watcher.run_loop(
-                            &config.agent_id,
+                            &config.sandbox_id,
                             &config.trace_id,
                             &tx,
                             &shutdown,
@@ -207,7 +207,7 @@ fn watch_fs_changes_polling(
             };
 
             if is_new {
-                let event = summary.to_event(&config.agent_id, &config.trace_id);
+                let event = summary.to_event(&config.sandbox_id, &config.trace_id);
                 if tx.send(event).is_err() {
                     return Ok(());
                 }
@@ -602,7 +602,7 @@ mod inotify_watcher {
 
         pub(super) fn run_loop(
             &mut self,
-            agent_id: &str,
+            sandbox_id: &str,
             trace_id: &str,
             tx: &std::sync::mpsc::Sender<CapturedEvent>,
             shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -718,7 +718,7 @@ mod inotify_watcher {
 
                     if let Some(summary) = scan_overlay_upper(&self.upper_dir).ok() {
                         if Self::has_changes(&summary, &prev_summary) {
-                            let event = summary.to_event(agent_id, trace_id);
+                            let event = summary.to_event(sandbox_id, trace_id);
                             if tx.send(event).is_err() {
                                 return Ok(());
                             }
@@ -847,7 +847,7 @@ mod tests {
         let after = tempfile::tempdir().unwrap();
 
         let config = FsTrackingConfig {
-            agent_id: "test-agent".to_string(),
+            sandbox_id: "test-agent".to_string(),
             trace_id: "test-trace".to_string(),
             method: FsTrackingMethod::SnapshotDiff {
                 before: before.path().to_path_buf(),
@@ -866,7 +866,7 @@ mod tests {
         fs::write(after.path().join("file.txt"), "data").unwrap();
 
         let config = FsTrackingConfig {
-            agent_id: "agent-1".to_string(),
+            sandbox_id: "agent-1".to_string(),
             trace_id: "trace-1".to_string(),
             method: FsTrackingMethod::SnapshotDiff {
                 before: before.path().to_path_buf(),
@@ -877,7 +877,7 @@ mod tests {
         let events = capture_fs_changes(&config).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, crate::EventType::FilesystemSummary);
-        assert_eq!(events[0].agent_id, "agent-1");
+        assert_eq!(events[0].sandbox_id, "agent-1");
         assert_eq!(events[0].trace_id, "trace-1");
 
         let summary: FsSummary = serde_json::from_value(events[0].payload.clone()).unwrap();

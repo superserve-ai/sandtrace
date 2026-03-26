@@ -3,7 +3,17 @@
 
 //! Human-readable terminal output for sandtrace watch.
 
+use std::collections::HashMap;
+
 use sandtrace_audit_chain::AuditEvent;
+
+/// Per-sandbox counters.
+#[derive(Default)]
+pub struct SandboxStats {
+    pub total: u64,
+    pub deny: u64,
+    pub anomaly: u64,
+}
 
 /// Counters for the summary at the end.
 #[derive(Default)]
@@ -14,21 +24,32 @@ pub struct WatchStats {
     pub anomaly: u64,
     pub deny_details: Vec<String>,
     pub anomaly_details: Vec<String>,
+    pub per_sandbox: HashMap<String, SandboxStats>,
 }
 
 impl WatchStats {
     pub fn record(&mut self, event: &AuditEvent) {
         self.total += 1;
+        let sb = self
+            .per_sandbox
+            .entry(event.sandbox_id.clone())
+            .or_default();
+        sb.total += 1;
+
         if let Some(v) = &event.verdict {
             match v.result.as_str() {
                 "allow" => self.allow += 1,
                 "deny" => {
                     self.deny += 1;
-                    self.deny_details.push(format!("{} — {}", v.policy_rule, v.reason));
+                    sb.deny += 1;
+                    self.deny_details
+                        .push(format!("[{}] {} — {}", event.sandbox_id, v.policy_rule, v.reason));
                 }
                 "anomaly" => {
                     self.anomaly += 1;
-                    self.anomaly_details.push(format!("{} — {}", v.policy_rule, v.reason));
+                    sb.anomaly += 1;
+                    self.anomaly_details
+                        .push(format!("[{}] {} — {}", event.sandbox_id, v.policy_rule, v.reason));
                 }
                 _ => self.allow += 1,
             }
@@ -38,11 +59,27 @@ impl WatchStats {
     }
 }
 
-/// Print the banner when watch starts.
-pub fn print_banner(sandbox_id: &str, provider: &str, policy_rules: usize, output: &str) {
+/// Truncate a sandbox ID for display (max 12 chars).
+fn short_id(id: &str) -> &str {
+    if id.len() <= 12 {
+        id
+    } else {
+        &id[..12]
+    }
+}
+
+/// Print the banner when watching starts.
+pub fn print_banner(sandbox_ids: &[String], provider: &str, policy_rules: usize, output: &str) {
     eprintln!();
     eprintln!("  \x1b[1msandtrace\x1b[0m v0.1.0 — hypervisor-level audit trail");
-    eprintln!("  sandbox:  {sandbox_id}");
+    if sandbox_ids.len() == 1 {
+        eprintln!("  sandbox:  {}", sandbox_ids[0]);
+    } else {
+        eprintln!("  sandboxes: {} discovered", sandbox_ids.len());
+        for id in sandbox_ids {
+            eprintln!("    - {id}");
+        }
+    }
     eprintln!("  provider: {provider}");
     if policy_rules > 0 {
         eprintln!("  policy:   {policy_rules} rules loaded");
@@ -57,9 +94,28 @@ pub fn print_banner(sandbox_id: &str, provider: &str, policy_rules: usize, outpu
     eprintln!();
 }
 
+/// Print a sandbox attach notification.
+pub fn print_attach(sandbox_id: &str) {
+    eprintln!(
+        "  \x1b[32m+\x1b[0m  attached to \x1b[36m{sandbox_id}\x1b[0m"
+    );
+}
+
+/// Print a sandbox detach notification.
+pub fn print_detach(sandbox_id: &str) {
+    eprintln!(
+        "  \x1b[31m-\x1b[0m  detached from \x1b[36m{sandbox_id}\x1b[0m"
+    );
+}
+
 /// Print a single event in human-readable format.
-pub fn print_event(event: &AuditEvent) {
+pub fn print_event(event: &AuditEvent, multi: bool) {
     let time = &event.wall_time[11..19]; // HH:MM:SS from ISO timestamp
+    let label = if multi {
+        format!("\x1b[36m{}\x1b[0m  ", short_id(&event.sandbox_id))
+    } else {
+        String::new()
+    };
 
     let (icon, color) = match event.verdict.as_ref().map(|v| v.result.as_str()) {
         Some("deny") => ("✗", "\x1b[31m"),   // red
@@ -68,24 +124,24 @@ pub fn print_event(event: &AuditEvent) {
     };
 
     match event.event_type.as_str() {
-        "network_egress" => print_network_event(event, time, icon, color),
-        "filesystem_summary" => print_filesystem_event(event, time, icon, color),
-        "syscall_activity" => print_syscall_event(event, time, icon, color),
+        "network_egress" => print_network_event(event, time, &label, icon, color),
+        "filesystem_summary" => print_filesystem_event(event, time, &label, icon, color),
+        "syscall_activity" => print_syscall_event(event, time, &label, icon, color),
         _ => {
-            eprintln!("  {time}  {color}{icon}\x1b[0m  {}", event.event_type);
+            eprintln!("  {time}  {color}{icon}\x1b[0m  {label}{}", event.event_type);
         }
     }
 
     // Print verdict reason for deny/anomaly
     if let Some(v) = &event.verdict {
         if v.result == "deny" || v.result == "anomaly" {
-            let label = v.result.to_uppercase();
-            eprintln!("  {color}         {label}\x1b[0m  {}", v.reason);
+            let result_label = v.result.to_uppercase();
+            eprintln!("  {color}         {result_label}\x1b[0m  {}", v.reason);
         }
     }
 }
 
-fn print_network_event(event: &AuditEvent, time: &str, icon: &str, color: &str) {
+fn print_network_event(event: &AuditEvent, time: &str, label: &str, icon: &str, color: &str) {
     let p = &event.payload;
     let host = p.get("dest_host").and_then(|v| v.as_str()).unwrap_or("?");
     let port = p.get("dest_port").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -93,26 +149,47 @@ fn print_network_event(event: &AuditEvent, time: &str, icon: &str, color: &str) 
     let recv = p.get("bytes_received").and_then(|v| v.as_u64()).unwrap_or(0);
 
     eprintln!(
-        "  {time}  {color}{icon}\x1b[0m  network     {host}:{port}{}{}",
+        "  {time}  {color}{icon}\x1b[0m  {label}network     {host}:{port}{}{}",
         format_bytes_arrow(sent, "↑"),
         format_bytes_arrow(recv, "↓"),
     );
 }
 
-fn print_filesystem_event(event: &AuditEvent, time: &str, icon: &str, color: &str) {
+fn print_filesystem_event(event: &AuditEvent, time: &str, label: &str, icon: &str, color: &str) {
     let p = &event.payload;
-    let created = p.get("files_created").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let modified = p.get("files_modified").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let deleted = p.get("files_deleted").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let bytes = p.get("total_bytes_written").and_then(|v| v.as_u64()).unwrap_or(0);
+    let created = p
+        .get("files_created")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let modified = p
+        .get("files_modified")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let deleted = p
+        .get("files_deleted")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let bytes = p
+        .get("total_bytes_written")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let mut parts = Vec::new();
-    if created > 0 { parts.push(format!("+{created}")); }
-    if modified > 0 { parts.push(format!("~{modified}")); }
-    if deleted > 0 { parts.push(format!("-{deleted}")); }
+    if created > 0 {
+        parts.push(format!("+{created}"));
+    }
+    if modified > 0 {
+        parts.push(format!("~{modified}"));
+    }
+    if deleted > 0 {
+        parts.push(format!("-{deleted}"));
+    }
 
     eprintln!(
-        "  {time}  {color}{icon}\x1b[0m  filesystem  {} files  {}",
+        "  {time}  {color}{icon}\x1b[0m  {label}filesystem  {} files  {}",
         parts.join(" "),
         format_bytes(bytes),
     );
@@ -135,13 +212,20 @@ fn print_filesystem_event(event: &AuditEvent, time: &str, icon: &str, color: &st
     }
 }
 
-fn print_syscall_event(event: &AuditEvent, time: &str, icon: &str, color: &str) {
+fn print_syscall_event(event: &AuditEvent, time: &str, label: &str, icon: &str, color: &str) {
     let p = &event.payload;
-    let total = p.get("total_syscalls").and_then(|v| v.as_u64()).unwrap_or(0);
-    let suspicious = p.get("suspicious").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let total = p
+        .get("total_syscalls")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let suspicious = p
+        .get("suspicious")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
 
     eprintln!(
-        "  {time}  {color}{icon}\x1b[0m  syscall     {total} calls, {suspicious} suspicious",
+        "  {time}  {color}{icon}\x1b[0m  {label}syscall     {total} calls, {suspicious} suspicious",
     );
 
     if let Some(sus) = p.get("suspicious").and_then(|v| v.as_array()) {
@@ -155,10 +239,19 @@ fn print_syscall_event(event: &AuditEvent, time: &str, icon: &str, color: &str) 
 
 /// Print the summary at the end of a watch session.
 pub fn print_summary(stats: &WatchStats, output: &str) {
+    let multi = stats.per_sandbox.len() > 1;
+
     eprintln!();
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!();
-    eprintln!("  \x1b[1msummary\x1b[0m");
+    if multi {
+        eprintln!(
+            "  \x1b[1msummary\x1b[0m ({} sandboxes)",
+            stats.per_sandbox.len()
+        );
+    } else {
+        eprintln!("  \x1b[1msummary\x1b[0m");
+    }
     eprintln!("  ───────");
     eprintln!("  events:     {}", stats.total);
     eprintln!("  \x1b[32mallow\x1b[0m:      {}", stats.allow);
@@ -174,6 +267,25 @@ pub fn print_summary(stats: &WatchStats, output: &str) {
         eprintln!("  \x1b[31mdeny\x1b[0m:       {}", stats.deny);
         for d in &stats.deny_details {
             eprintln!("              {d}");
+        }
+    }
+
+    // Per-sandbox breakdown for multi-VM mode
+    if multi {
+        eprintln!();
+        eprintln!("  \x1b[1mper-sandbox\x1b[0m");
+        let mut ids: Vec<&String> = stats.per_sandbox.keys().collect();
+        ids.sort();
+        for id in ids {
+            let sb = &stats.per_sandbox[id];
+            let status = if sb.deny > 0 {
+                format!("\x1b[31m{} deny\x1b[0m", sb.deny)
+            } else if sb.anomaly > 0 {
+                format!("\x1b[33m{} anomaly\x1b[0m", sb.anomaly)
+            } else {
+                "\x1b[32mclean\x1b[0m".to_string()
+            };
+            eprintln!("    {id}: {} events, {status}", sb.total);
         }
     }
 

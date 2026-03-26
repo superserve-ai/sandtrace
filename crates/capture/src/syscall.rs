@@ -25,7 +25,7 @@ pub struct SyscallMonitorConfig {
     /// PID of the jailer process to attach to.
     pub jailer_pid: u32,
     /// Agent identifier for event attribution.
-    pub agent_id: String,
+    pub sandbox_id: String,
     /// Trace identifier for this capture session.
     pub trace_id: String,
     /// How long to capture syscalls. Defaults to 5 seconds.
@@ -36,7 +36,7 @@ impl Default for SyscallMonitorConfig {
     fn default() -> Self {
         Self {
             jailer_pid: 0,
-            agent_id: String::new(),
+            sandbox_id: String::new(),
             trace_id: String::new(),
             capture_duration: None,
         }
@@ -77,10 +77,10 @@ pub struct SuspiciousActivity {
 
 impl SyscallSummary {
     /// Convert this summary into a `CapturedEvent`.
-    pub fn to_event(&self, agent_id: &str, trace_id: &str) -> CapturedEvent {
+    pub fn to_event(&self, sandbox_id: &str, trace_id: &str) -> CapturedEvent {
         CapturedEvent::new(
             EventType::SyscallActivity,
-            agent_id,
+            sandbox_id,
             trace_id,
             serde_json::to_value(self).expect("SyscallSummary is always serializable"),
         )
@@ -447,7 +447,7 @@ mod linux_ptrace {
             "syscall capture complete"
         );
 
-        Ok(vec![summary.to_event(&config.agent_id, &config.trace_id)])
+        Ok(vec![summary.to_event(&config.sandbox_id, &config.trace_id)])
     }
 
     pub fn capture_continuous(
@@ -525,7 +525,7 @@ mod linux_ptrace {
         }
 
         let jailer_pid = config.jailer_pid;
-        let agent_id = config.agent_id.clone();
+        let sandbox_id = config.sandbox_id.clone();
         let trace_id = config.trace_id.clone();
 
         let handle = std::thread::Builder::new()
@@ -546,7 +546,7 @@ mod linux_ptrace {
                         // Check flush interval even when idle.
                         if last_flush.elapsed() >= flush_interval && tracker.total_count() > 0 {
                             let summary = tracker.drain_summary();
-                            let event = summary.to_event(&agent_id, &trace_id);
+                            let event = summary.to_event(&sandbox_id, &trace_id);
                             if tx.send(event).is_err() {
                                 return;
                             }
@@ -596,7 +596,7 @@ mod linux_ptrace {
                     // Periodic flush.
                     if last_flush.elapsed() >= flush_interval && tracker.total_count() > 0 {
                         let summary = tracker.drain_summary();
-                        let event = summary.to_event(&agent_id, &trace_id);
+                        let event = summary.to_event(&sandbox_id, &trace_id);
                         if tx.send(event).is_err() {
                             return;
                         }
@@ -607,7 +607,7 @@ mod linux_ptrace {
                 // Final flush on shutdown.
                 if tracker.total_count() > 0 {
                     let summary = tracker.drain_summary();
-                    let event = summary.to_event(&agent_id, &trace_id);
+                    let event = summary.to_event(&sandbox_id, &trace_id);
                     let _ = tx.send(event);
                 }
             })?;
@@ -966,7 +966,7 @@ mod tests {
         let event = summary.to_event("agent-1", "trace-1");
 
         assert_eq!(event.event_type, EventType::SyscallActivity);
-        assert_eq!(event.agent_id, "agent-1");
+        assert_eq!(event.sandbox_id, "agent-1");
         assert_eq!(event.trace_id, "trace-1");
 
         let parsed = parse_syscall_payload(&event).expect("should parse");
@@ -1058,7 +1058,7 @@ mod tests {
     fn capture_returns_error_on_non_linux() {
         let config = SyscallMonitorConfig {
             jailer_pid: 1,
-            agent_id: "test".to_string(),
+            sandbox_id: "test".to_string(),
             trace_id: "test".to_string(),
             capture_duration: None,
         };

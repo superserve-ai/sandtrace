@@ -657,7 +657,7 @@ mod tests {
             schema_version: "2.0".into(),
             event_id: "e1".into(),
             event_type: event_type.into(),
-            agent_id: "a1".into(),
+            sandbox_id: "a1".into(),
             trace_id: "t1".into(),
             seq: 1,
             prev_hash: None,

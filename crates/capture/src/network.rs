@@ -22,7 +22,7 @@ pub struct NetworkCaptureConfig {
     /// Name of the tap device (e.g., "tap0", "vmtap0").
     pub tap_device: String,
     /// Agent identifier for event attribution.
-    pub agent_id: String,
+    pub sandbox_id: String,
     /// Trace identifier for this capture session.
     pub trace_id: String,
     /// Optional VM MAC address for determining packet direction.
@@ -39,7 +39,7 @@ impl Default for NetworkCaptureConfig {
     fn default() -> Self {
         Self {
             tap_device: String::new(),
-            agent_id: String::new(),
+            sandbox_id: String::new(),
             trace_id: String::new(),
             vm_mac: None,
             capture_duration: None,
@@ -87,7 +87,7 @@ pub fn capture_egress(config: &NetworkCaptureConfig) -> Result<Vec<CapturedEvent
         }
     }
 
-    Ok(tracker.drain_events_with_dns(&config.agent_id, &config.trace_id, &dns))
+    Ok(tracker.drain_events_with_dns(&config.sandbox_id, &config.trace_id, &dns))
 }
 
 /// Continuously captures network egress and sends events through a channel.
@@ -135,7 +135,7 @@ pub fn capture_egress_streaming(
         // Periodically flush accumulated connections as events.
         if last_flush.elapsed() >= flush_interval && tracker.connection_count() > 0 {
             let events = tracker.drain_events_with_dns(
-                &config.agent_id, &config.trace_id, &dns,
+                &config.sandbox_id, &config.trace_id, &dns,
             );
             for event in events {
                 if tx.send(event).is_err() {
@@ -149,7 +149,7 @@ pub fn capture_egress_streaming(
     // Final flush on shutdown.
     if tracker.connection_count() > 0 {
         let events = tracker.drain_events_with_dns(
-            &config.agent_id, &config.trace_id, &dns,
+            &config.sandbox_id, &config.trace_id, &dns,
         );
         for event in events {
             let _ = tx.send(event);
@@ -174,7 +174,7 @@ pub fn capture_egress_continuous(
     let mut sniffer = TapSniffer::open(&config.tap_device)?;
     sniffer.set_timeout(config.read_timeout)?;
 
-    let agent_id = config.agent_id.clone();
+    let sandbox_id = config.sandbox_id.clone();
     let trace_id = config.trace_id.clone();
     let vm_mac = config.vm_mac;
 
@@ -202,7 +202,7 @@ pub fn capture_egress_continuous(
 
                 // Periodically flush accumulated events.
                 if last_flush.elapsed() >= flush_interval && tracker.connection_count() > 0 {
-                    let events = tracker.drain_events(&agent_id, &trace_id);
+                    let events = tracker.drain_events(&sandbox_id, &trace_id);
                     for event in events {
                         if tx.send(event).is_err() {
                             return; // receiver dropped
@@ -214,7 +214,7 @@ pub fn capture_egress_continuous(
 
             // Final flush on shutdown.
             if tracker.connection_count() > 0 {
-                let events = tracker.drain_events(&agent_id, &trace_id);
+                let events = tracker.drain_events(&sandbox_id, &trace_id);
                 for event in events {
                     let _ = tx.send(event);
                 }
@@ -245,17 +245,24 @@ pub struct EgressInfo {
 
 // ── DNS sniffing ─────────────────────────────────────────────────────
 
+/// Maximum DNS cache entries. Evicts oldest when full.
+const MAX_DNS_CACHE_ENTRIES: usize = 10_000;
+
 /// Passive DNS cache built by sniffing DNS response packets on the tap.
 /// Maps IP addresses to hostnames observed in DNS A/AAAA responses.
+/// Bounded to prevent unbounded memory growth.
 pub struct DnsCache {
     /// IP → hostname mapping. Most recent answer wins.
     names: HashMap<IpAddr, String>,
+    /// Insertion order for FIFO eviction (O(1) front removal).
+    order: std::collections::VecDeque<IpAddr>,
 }
 
 impl DnsCache {
     pub fn new() -> Self {
         Self {
             names: HashMap::new(),
+            order: std::collections::VecDeque::new(),
         }
     }
 
@@ -277,6 +284,19 @@ impl DnsCache {
             return;
         }
         self.parse_dns_response(transport_payload);
+    }
+
+    /// Insert a mapping, evicting the oldest entry if at capacity.
+    fn insert(&mut self, ip: IpAddr, name: String) {
+        if !self.names.contains_key(&ip) && self.names.len() >= MAX_DNS_CACHE_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.names.remove(&oldest);
+            }
+        }
+        if !self.names.contains_key(&ip) {
+            self.order.push_back(ip);
+        }
+        self.names.insert(ip, name);
     }
 
     /// Resolve an IP address to a hostname if known.
@@ -356,14 +376,14 @@ impl DnsCache {
                         let ip = IpAddr::V4(Ipv4Addr::new(
                             data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
                         ));
-                        self.names.insert(ip, name.clone());
+                        self.insert(ip, name.clone());
                     }
                     28 if rdlength == 16 => {
                         // AAAA record — IPv6
                         let mut bytes = [0u8; 16];
                         bytes.copy_from_slice(&data[pos..pos + 16]);
                         let ip = IpAddr::V6(std::net::Ipv6Addr::from(bytes));
-                        self.names.insert(ip, name.clone());
+                        self.insert(ip, name.clone());
                     }
                     _ => {}
                 }
@@ -525,15 +545,15 @@ impl ConnectionTracker {
 
     /// Drain all tracked connections into `CapturedEvent`s.
     /// Uses IP addresses as `dest_host`.
-    pub fn drain_events(&mut self, agent_id: &str, trace_id: &str) -> Vec<CapturedEvent> {
-        self.drain_events_with_dns(agent_id, trace_id, &DnsCache::new())
+    pub fn drain_events(&mut self, sandbox_id: &str, trace_id: &str) -> Vec<CapturedEvent> {
+        self.drain_events_with_dns(sandbox_id, trace_id, &DnsCache::new())
     }
 
     /// Drain all tracked connections into `CapturedEvent`s.
     /// Enriches `dest_host` with DNS hostnames when available.
     pub fn drain_events_with_dns(
         &mut self,
-        agent_id: &str,
+        sandbox_id: &str,
         trace_id: &str,
         dns: &DnsCache,
     ) -> Vec<CapturedEvent> {
@@ -560,7 +580,7 @@ impl ConnectionTracker {
                     "bytes_received": stats.bytes_received,
                     "packet_count": stats.packet_count,
                 });
-                CapturedEvent::new(EventType::NetworkEgress, agent_id, trace_id, payload)
+                CapturedEvent::new(EventType::NetworkEgress, sandbox_id, trace_id, payload)
             })
             .collect()
     }
@@ -682,7 +702,7 @@ mod tests {
         // All events should be NetworkEgress type
         for ev in &events {
             assert_eq!(ev.event_type, EventType::NetworkEgress);
-            assert_eq!(ev.agent_id, "agent-1");
+            assert_eq!(ev.sandbox_id, "agent-1");
             assert_eq!(ev.trace_id, "trace-1");
         }
     }
@@ -797,7 +817,7 @@ mod tests {
     fn dns_cache_enriches_dest_host() {
         let mut dns = DnsCache::new();
         let ip = IpAddr::V4(Ipv4Addr::new(104, 16, 0, 1));
-        dns.names.insert(ip, "api.stripe.com".to_string());
+        dns.insert(ip, "api.stripe.com".to_string());
 
         let mut tracker = ConnectionTracker::new();
         tracker.record_packet(&ParsedPacket {
