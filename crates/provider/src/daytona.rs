@@ -12,12 +12,15 @@
 //! - Metadata: `{workspace_root}/workspace.json`
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use sandtrace_capture::CapturedEvent;
-use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, capture_fs_changes};
-use sandtrace_capture::network::{NetworkCaptureConfig, capture_egress};
-use sandtrace_capture::syscall::{SyscallMonitorConfig, capture_syscalls};
+use anyhow::Result;
+use sandtrace_capture::CaptureStream;
+use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, watch_fs_changes};
+use sandtrace_capture::network::{NetworkCaptureConfig, capture_egress_continuous};
+use sandtrace_capture::syscall::{SyscallMonitorConfig, capture_syscalls_continuous};
 
 use crate::SandboxProvider;
 
@@ -77,8 +80,9 @@ impl DaytonaProvider {
 }
 
 impl SandboxProvider for DaytonaProvider {
-    fn attach(&self, sandbox_id: &str) -> Result<Box<dyn Iterator<Item = CapturedEvent>>> {
+    fn attach(&self, sandbox_id: &str) -> Result<CaptureStream> {
         let trace_id = uuid::Uuid::new_v4().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let method = match &self.tracking {
             DaytonaTracking::Overlay => {
@@ -86,7 +90,7 @@ impl SandboxProvider for DaytonaProvider {
                 tracing::info!(
                     sandbox_id,
                     upper = %upper.display(),
-                    "attaching to Daytona workspace via overlay"
+                    "attaching to Daytona workspace via overlay (continuous)"
                 );
                 FsTrackingMethod::OverlayUpperDir { upper_dir: upper }
             }
@@ -95,7 +99,7 @@ impl SandboxProvider for DaytonaProvider {
                     sandbox_id,
                     before = %before_dir.display(),
                     after = %after_dir.display(),
-                    "attaching to Daytona workspace via snapshot diff"
+                    "attaching to Daytona workspace via snapshot diff (continuous)"
                 );
                 FsTrackingMethod::SnapshotDiff {
                     before: before_dir.clone(),
@@ -104,16 +108,20 @@ impl SandboxProvider for DaytonaProvider {
             }
         };
 
+        let (tx, stream) = CaptureStream::channel();
+
+        // Filesystem monitoring thread.
         let fs_config = FsTrackingConfig {
             agent_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
             method,
         };
+        match watch_fs_changes(&fs_config, tx.clone(), shutdown.clone(), Duration::from_secs(2)) {
+            Ok(_) => tracing::info!("filesystem watch thread started"),
+            Err(e) => tracing::warn!(error = %e, "filesystem watch failed, continuing without it"),
+        }
 
-        let mut events = capture_fs_changes(&fs_config)
-            .context("Daytona filesystem capture failed")?;
-
-        // Network capture via tap device (if configured).
+        // Network capture thread (if configured).
         if let Some(tap) = &self.tap_device {
             let net_config = NetworkCaptureConfig {
                 tap_device: tap.clone(),
@@ -121,13 +129,13 @@ impl SandboxProvider for DaytonaProvider {
                 trace_id: trace_id.clone(),
                 ..Default::default()
             };
-            match capture_egress(&net_config) {
-                Ok(net_events) => events.extend(net_events),
+            match capture_egress_continuous(&net_config, tx.clone(), shutdown.clone(), Duration::from_secs(5)) {
+                Ok(_) => tracing::info!("network capture thread started"),
                 Err(e) => tracing::warn!(error = %e, "network capture failed, continuing without it"),
             }
         }
 
-        // Syscall capture via ptrace on the jailer process (if configured).
+        // Syscall capture thread (if configured).
         if let Some(pid) = self.jailer_pid {
             let sc_config = SyscallMonitorConfig {
                 jailer_pid: pid,
@@ -135,13 +143,14 @@ impl SandboxProvider for DaytonaProvider {
                 trace_id,
                 ..Default::default()
             };
-            match capture_syscalls(&sc_config) {
-                Ok(sc_events) => events.extend(sc_events),
+            match capture_syscalls_continuous(&sc_config, tx.clone(), shutdown.clone(), Duration::from_secs(5)) {
+                Ok(_) => tracing::info!("syscall capture thread started"),
                 Err(e) => tracing::warn!(error = %e, "syscall capture failed, continuing without it"),
             }
         }
 
-        Ok(Box::new(events.into_iter()))
+        drop(tx);
+        Ok(stream)
     }
 
     fn name(&self) -> &str {
@@ -197,7 +206,11 @@ mod tests {
             ..Default::default()
         };
 
-        let events: Vec<_> = provider.attach("ws-1").unwrap().collect();
+        let stream = provider.attach("ws-1").unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = stream.recv_timeout(std::time::Duration::from_secs(5)) {
+            events.push(ev);
+        }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, sandtrace_capture::EventType::FilesystemSummary);
     }
@@ -217,7 +230,11 @@ mod tests {
             ..Default::default()
         };
 
-        let events: Vec<_> = provider.attach("ws-1").unwrap().collect();
+        let stream = provider.attach("ws-1").unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = stream.recv_timeout(std::time::Duration::from_secs(5)) {
+            events.push(ev);
+        }
         assert_eq!(events.len(), 1);
     }
 
@@ -233,7 +250,8 @@ mod tests {
             ..Default::default()
         };
 
-        let events: Vec<_> = provider.attach("ws-1").unwrap().collect();
-        assert!(events.is_empty());
+        let stream = provider.attach("ws-1").unwrap();
+        let event = stream.recv_timeout(std::time::Duration::from_secs(4));
+        assert!(event.is_none());
     }
 }

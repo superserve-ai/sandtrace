@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -82,6 +84,71 @@ pub fn capture_egress(config: &NetworkCaptureConfig) -> Result<Vec<CapturedEvent
     }
 
     Ok(tracker.drain_events(&config.agent_id, &config.trace_id))
+}
+
+/// Start continuous network capture on a background thread.
+///
+/// Reads packets in a loop, periodically flushing aggregated connection
+/// events through `tx`. Runs until `shutdown` is set to `true` or the
+/// sender is dropped. The flush interval controls how often accumulated
+/// connection stats are drained and sent as events.
+pub fn capture_egress_continuous(
+    config: &NetworkCaptureConfig,
+    tx: mpsc::Sender<CapturedEvent>,
+    shutdown: Arc<AtomicBool>,
+    flush_interval: Duration,
+) -> Result<std::thread::JoinHandle<()>> {
+    let mut sniffer = TapSniffer::open(&config.tap_device)?;
+    sniffer.set_timeout(config.read_timeout)?;
+
+    let agent_id = config.agent_id.clone();
+    let trace_id = config.trace_id.clone();
+    let vm_mac = config.vm_mac;
+
+    let handle = std::thread::Builder::new()
+        .name("sandtrace-net-capture".into())
+        .spawn(move || {
+            let mut tracker = ConnectionTracker::new();
+            let mut last_flush = Instant::now();
+
+            while !shutdown.load(Ordering::Relaxed) {
+                match sniffer.read_frame() {
+                    Ok(Some(frame)) => {
+                        if let Some(pkt) = packet::parse_frame(frame, vm_mac.as_ref()) {
+                            tracker.record_packet(&pkt);
+                        }
+                    }
+                    Ok(None) => {
+                        // Read timeout — no traffic, continue loop
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "network capture read error");
+                        break;
+                    }
+                }
+
+                // Periodically flush accumulated events.
+                if last_flush.elapsed() >= flush_interval && tracker.connection_count() > 0 {
+                    let events = tracker.drain_events(&agent_id, &trace_id);
+                    for event in events {
+                        if tx.send(event).is_err() {
+                            return; // receiver dropped
+                        }
+                    }
+                    last_flush = Instant::now();
+                }
+            }
+
+            // Final flush on shutdown.
+            if tracker.connection_count() > 0 {
+                let events = tracker.drain_events(&agent_id, &trace_id);
+                for event in events {
+                    let _ = tx.send(event);
+                }
+            }
+        })?;
+
+    Ok(handle)
 }
 
 /// Parse a network egress event payload into structured fields.

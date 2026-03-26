@@ -3,16 +3,29 @@
 //! Connects to a Firecracker microVM via its tap device and overlay
 //! filesystem to capture network, filesystem, and syscall events.
 //! Uses OverlayFS upper-dir scanning for filesystem change detection.
+//!
+//! Each capture source runs on its own background thread, feeding events
+//! into a shared mpsc channel for continuous monitoring.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use sandtrace_capture::CapturedEvent;
-use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, capture_fs_changes};
-use sandtrace_capture::network::{NetworkCaptureConfig, capture_egress};
-use sandtrace_capture::syscall::{SyscallMonitorConfig, capture_syscalls};
+use sandtrace_capture::CaptureStream;
+use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, watch_fs_changes};
+use sandtrace_capture::network::{NetworkCaptureConfig, capture_egress_continuous};
+use sandtrace_capture::syscall::{SyscallMonitorConfig, capture_syscalls_continuous};
 
 use crate::SandboxProvider;
+
+/// Default interval for flushing accumulated network events.
+const NET_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Default interval for re-scanning the overlay filesystem.
+const FS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Default interval for flushing accumulated syscall summaries.
+const SC_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Firecracker VM provider configuration.
 #[derive(Debug, Clone)]
@@ -29,15 +42,19 @@ pub struct FirecrackerProvider {
 }
 
 impl SandboxProvider for FirecrackerProvider {
-    fn attach(&self, sandbox_id: &str) -> Result<Box<dyn Iterator<Item = CapturedEvent>>> {
+    fn attach(&self, sandbox_id: &str) -> Result<CaptureStream> {
         let trace_id = uuid::Uuid::new_v4().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         tracing::info!(
             sandbox_id,
             socket = %self.socket_path,
-            "attaching to Firecracker VM"
+            "attaching to Firecracker VM (continuous)"
         );
 
+        let (tx, stream) = CaptureStream::channel();
+
+        // Filesystem monitoring thread — periodic overlay re-scan.
         let fs_config = FsTrackingConfig {
             agent_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
@@ -45,22 +62,24 @@ impl SandboxProvider for FirecrackerProvider {
                 upper_dir: PathBuf::from(&self.overlay_upper_dir),
             },
         };
+        match watch_fs_changes(&fs_config, tx.clone(), shutdown.clone(), FS_POLL_INTERVAL) {
+            Ok(_handle) => tracing::info!("filesystem watch thread started"),
+            Err(e) => tracing::warn!(error = %e, "filesystem watch failed, continuing without it"),
+        }
 
-        let mut events = capture_fs_changes(&fs_config)?;
-
-        // Network capture via tap device.
+        // Network capture thread — continuous AF_PACKET sniffing.
         let net_config = NetworkCaptureConfig {
             tap_device: self.tap_device.clone(),
             agent_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
             ..Default::default()
         };
-        match capture_egress(&net_config) {
-            Ok(net_events) => events.extend(net_events),
+        match capture_egress_continuous(&net_config, tx.clone(), shutdown.clone(), NET_FLUSH_INTERVAL) {
+            Ok(_handle) => tracing::info!("network capture thread started"),
             Err(e) => tracing::warn!(error = %e, "network capture failed, continuing without it"),
         }
 
-        // Syscall capture via ptrace on the jailer process.
+        // Syscall capture thread — continuous ptrace monitoring.
         if let Some(pid) = self.jailer_pid {
             let sc_config = SyscallMonitorConfig {
                 jailer_pid: pid,
@@ -68,13 +87,21 @@ impl SandboxProvider for FirecrackerProvider {
                 trace_id,
                 ..Default::default()
             };
-            match capture_syscalls(&sc_config) {
-                Ok(sc_events) => events.extend(sc_events),
+            match capture_syscalls_continuous(&sc_config, tx.clone(), shutdown.clone(), SC_FLUSH_INTERVAL) {
+                Ok(_handle) => tracing::info!("syscall capture thread started"),
                 Err(e) => tracing::warn!(error = %e, "syscall capture failed, continuing without it"),
             }
         }
 
-        Ok(Box::new(events.into_iter()))
+        // Drop the original sender so the stream ends when all capture
+        // threads finish (their cloned senders are dropped).
+        drop(tx);
+
+        // Store shutdown flag in the stream so it can be triggered externally.
+        // For now, the capture threads will run until the process exits or
+        // their individual error conditions trigger.
+
+        Ok(stream)
     }
 
     fn name(&self) -> &str {

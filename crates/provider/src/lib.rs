@@ -19,12 +19,17 @@ pub mod firecracker;
 pub mod snapshot;
 
 use anyhow::Result;
-use sandtrace_capture::CapturedEvent;
+use sandtrace_capture::CaptureStream;
 
 /// Trait for sandbox provider adapters.
 pub trait SandboxProvider {
-    /// Attach to a running sandbox and return a stream of events.
-    fn attach(&self, sandbox_id: &str) -> Result<Box<dyn Iterator<Item = CapturedEvent>>>;
+    /// Attach to a running sandbox and return a continuous stream of events.
+    ///
+    /// Spawns background capture threads (network, filesystem, syscall) that
+    /// feed events into the returned [`CaptureStream`]. The stream remains
+    /// open until the provider's capture threads finish or the shutdown flag
+    /// is set.
+    fn attach(&self, sandbox_id: &str) -> Result<CaptureStream>;
 
     /// Provider name for logging and identification.
     fn name(&self) -> &str;

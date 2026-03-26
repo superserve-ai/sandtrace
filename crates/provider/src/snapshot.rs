@@ -5,10 +5,13 @@
 //! directory trees (before and after agent execution) to detect changes.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use sandtrace_capture::CapturedEvent;
-use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, capture_fs_changes};
+use sandtrace_capture::CaptureStream;
+use sandtrace_capture::filesystem::{FsTrackingConfig, FsTrackingMethod, watch_fs_changes};
 
 use crate::SandboxProvider;
 
@@ -28,14 +31,17 @@ pub struct SnapshotProvider {
 }
 
 impl SandboxProvider for SnapshotProvider {
-    fn attach(&self, sandbox_id: &str) -> Result<Box<dyn Iterator<Item = CapturedEvent>>> {
+    fn attach(&self, sandbox_id: &str) -> Result<CaptureStream> {
         tracing::info!(
             sandbox_id,
             provider = %self.provider_name,
             before = %self.before_dir,
             after = %self.after_dir,
-            "attaching via snapshot diff"
+            "attaching via snapshot diff (continuous)"
         );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, stream) = CaptureStream::channel();
 
         let config = FsTrackingConfig {
             agent_id: sandbox_id.to_string(),
@@ -46,8 +52,13 @@ impl SandboxProvider for SnapshotProvider {
             },
         };
 
-        let fs_events = capture_fs_changes(&config)?;
-        Ok(Box::new(fs_events.into_iter()))
+        match watch_fs_changes(&config, tx.clone(), shutdown, Duration::from_secs(2)) {
+            Ok(_) => tracing::info!("filesystem watch thread started"),
+            Err(e) => tracing::warn!(error = %e, "filesystem watch failed"),
+        }
+
+        drop(tx);
+        Ok(stream)
     }
 
     fn name(&self) -> &str {

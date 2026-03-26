@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -112,6 +115,83 @@ pub fn capture_fs_changes(config: &FsTrackingConfig) -> Result<Vec<CapturedEvent
     );
 
     Ok(vec![summary.to_event(&config.agent_id, &config.trace_id)])
+}
+
+/// Start continuous filesystem monitoring on a background thread.
+///
+/// Periodically re-scans the configured filesystem source and sends new
+/// summary events through `tx` whenever changes are detected. For overlay
+/// tracking this re-walks the upper directory; for snapshot tracking this
+/// re-diffs the two trees. Runs until `shutdown` is set or the sender drops.
+pub fn watch_fs_changes(
+    config: &FsTrackingConfig,
+    tx: mpsc::Sender<CapturedEvent>,
+    shutdown: Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<std::thread::JoinHandle<()>> {
+    let config = config.clone();
+
+    let handle = std::thread::Builder::new()
+        .name("sandtrace-fs-watch".into())
+        .spawn(move || {
+            // Track previously seen state to detect incremental changes.
+            let mut prev_modified: Vec<String> = Vec::new();
+            let mut prev_created: Vec<String> = Vec::new();
+            let mut prev_deleted: Vec<String> = Vec::new();
+
+            while !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(poll_interval);
+
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let summary = match &config.method {
+                    FsTrackingMethod::OverlayUpperDir { upper_dir } => {
+                        match scan_overlay_upper(upper_dir) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "fs watch scan failed");
+                                continue;
+                            }
+                        }
+                    }
+                    FsTrackingMethod::SnapshotDiff { before, after } => {
+                        match diff_snapshots(before, after) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "fs watch diff failed");
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                // Only emit if the state has changed since last scan.
+                if summary.files_modified != prev_modified
+                    || summary.files_created != prev_created
+                    || summary.files_deleted != prev_deleted
+                {
+                    prev_modified = summary.files_modified.clone();
+                    prev_created = summary.files_created.clone();
+                    prev_deleted = summary.files_deleted.clone();
+
+                    if summary.files_created.is_empty()
+                        && summary.files_modified.is_empty()
+                        && summary.files_deleted.is_empty()
+                    {
+                        continue;
+                    }
+
+                    let event = summary.to_event(&config.agent_id, &config.trace_id);
+                    if tx.send(event).is_err() {
+                        return; // receiver dropped
+                    }
+                }
+            }
+        })?;
+
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------

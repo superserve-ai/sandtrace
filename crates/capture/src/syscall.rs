@@ -9,6 +9,8 @@
 //! Linux-only — returns an error on other platforms.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -247,6 +249,35 @@ pub fn capture_syscalls(config: &SyscallMonitorConfig) -> Result<Vec<CapturedEve
     )
 }
 
+/// Start continuous syscall monitoring on a background thread.
+///
+/// Attaches via ptrace and runs indefinitely, periodically draining
+/// accumulated syscall summaries through `tx`. Runs until `shutdown`
+/// is set or the traced process exits.
+#[cfg(target_os = "linux")]
+pub fn capture_syscalls_continuous(
+    config: &SyscallMonitorConfig,
+    tx: mpsc::Sender<CapturedEvent>,
+    shutdown: Arc<AtomicBool>,
+    flush_interval: Duration,
+) -> Result<std::thread::JoinHandle<()>> {
+    linux_ptrace::capture_continuous(config, tx, shutdown, flush_interval)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn capture_syscalls_continuous(
+    config: &SyscallMonitorConfig,
+    _tx: mpsc::Sender<CapturedEvent>,
+    _shutdown: Arc<AtomicBool>,
+    _flush_interval: Duration,
+) -> Result<std::thread::JoinHandle<()>> {
+    let _ = config;
+    anyhow::bail!(
+        "syscall monitoring requires Linux (ptrace/seccomp-bpf). \
+         Current platform is not supported."
+    )
+}
+
 /// Stub kept for backwards compatibility — prefer [`capture_syscalls`].
 pub fn attach_monitor(config: &SyscallMonitorConfig) -> Result<()> {
     let _ = capture_syscalls(config)?;
@@ -417,6 +448,171 @@ mod linux_ptrace {
         );
 
         Ok(vec![summary.to_event(&config.agent_id, &config.trace_id)])
+    }
+
+    pub fn capture_continuous(
+        config: &SyscallMonitorConfig,
+        tx: mpsc::Sender<CapturedEvent>,
+        shutdown: Arc<AtomicBool>,
+        flush_interval: Duration,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        let pid = config.jailer_pid as libc::pid_t;
+
+        tracing::info!(pid, "attaching continuous ptrace syscall monitor");
+
+        // Attach without stopping the process.
+        let ret = unsafe {
+            libc::ptrace(
+                PTRACE_SEIZE,
+                pid,
+                ptr::null_mut::<libc::c_void>(),
+                ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context(format!("ptrace SEIZE on pid {pid}"));
+        }
+
+        // Interrupt to configure options.
+        let ret = unsafe {
+            libc::ptrace(
+                PTRACE_INTERRUPT,
+                pid,
+                ptr::null_mut::<libc::c_void>(),
+                ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if ret < 0 {
+            unsafe {
+                libc::ptrace(libc::PTRACE_DETACH, pid, ptr::null_mut::<libc::c_void>(), ptr::null_mut::<libc::c_void>());
+            }
+            return Err(std::io::Error::last_os_error())
+                .context(format!("ptrace INTERRUPT on pid {pid}"));
+        }
+
+        // Wait for the process to stop.
+        let mut status: libc::c_int = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, libc::__WALL);
+        }
+
+        // Enable TRACESYSGOOD.
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SETOPTIONS,
+                pid,
+                ptr::null_mut::<libc::c_void>(),
+                libc::PTRACE_O_TRACESYSGOOD as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            unsafe {
+                libc::ptrace(libc::PTRACE_DETACH, pid, ptr::null_mut::<libc::c_void>(), ptr::null_mut::<libc::c_void>());
+            }
+            return Err(std::io::Error::last_os_error())
+                .context(format!("ptrace SETOPTIONS on pid {pid}"));
+        }
+
+        // Resume — stop at next syscall boundary.
+        unsafe {
+            libc::ptrace(
+                libc::PTRACE_SYSCALL,
+                pid,
+                ptr::null_mut::<libc::c_void>(),
+                ptr::null_mut::<libc::c_void>(),
+            );
+        }
+
+        let jailer_pid = config.jailer_pid;
+        let agent_id = config.agent_id.clone();
+        let trace_id = config.trace_id.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("sandtrace-sc-capture".into())
+            .spawn(move || {
+                let _guard = DetachGuard(pid);
+                let mut tracker = SyscallTracker::new(jailer_pid);
+                let mut last_flush = Instant::now();
+                let mut at_entry = true;
+
+                while !shutdown.load(Ordering::Relaxed) {
+                    status = 0;
+                    let ret = unsafe { libc::waitpid(pid, &mut status, libc::__WALL | libc::WNOHANG) };
+
+                    if ret == 0 {
+                        std::thread::sleep(Duration::from_micros(100));
+
+                        // Check flush interval even when idle.
+                        if last_flush.elapsed() >= flush_interval && tracker.total_count() > 0 {
+                            let summary = tracker.drain_summary();
+                            let event = summary.to_event(&agent_id, &trace_id);
+                            if tx.send(event).is_err() {
+                                return;
+                            }
+                            last_flush = Instant::now();
+                        }
+                        continue;
+                    }
+                    if ret < 0 {
+                        tracing::debug!(pid, "waitpid returned error, stopping capture");
+                        break;
+                    }
+
+                    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                        tracing::debug!(pid, "traced process exited");
+                        break;
+                    }
+
+                    if libc::WIFSTOPPED(status) {
+                        let sig = libc::WSTOPSIG(status);
+                        if sig == (libc::SIGTRAP | 0x80) {
+                            if at_entry {
+                                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                                unsafe {
+                                    libc::ptrace(
+                                        libc::PTRACE_GETREGS,
+                                        pid,
+                                        ptr::null_mut::<libc::c_void>(),
+                                        &mut regs as *mut _ as *mut libc::c_void,
+                                    );
+                                }
+                                tracker.record_syscall(regs.orig_rax, None);
+                            }
+                            at_entry = !at_entry;
+                        }
+                    }
+
+                    // Resume to next syscall boundary.
+                    unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_SYSCALL,
+                            pid,
+                            ptr::null_mut::<libc::c_void>(),
+                            ptr::null_mut::<libc::c_void>(),
+                        );
+                    }
+
+                    // Periodic flush.
+                    if last_flush.elapsed() >= flush_interval && tracker.total_count() > 0 {
+                        let summary = tracker.drain_summary();
+                        let event = summary.to_event(&agent_id, &trace_id);
+                        if tx.send(event).is_err() {
+                            return;
+                        }
+                        last_flush = Instant::now();
+                    }
+                }
+
+                // Final flush on shutdown.
+                if tracker.total_count() > 0 {
+                    let summary = tracker.drain_summary();
+                    let event = summary.to_event(&agent_id, &trace_id);
+                    let _ = tx.send(event);
+                }
+            })?;
+
+        Ok(handle)
     }
 }
 

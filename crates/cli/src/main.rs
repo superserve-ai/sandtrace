@@ -263,7 +263,7 @@ async fn cmd_watch(
     let provider = sandtrace_provider::detect::create_default_provider();
     tracing::info!(provider = provider.name(), "detected provider");
 
-    let captured_events = provider.attach(&sandbox_id)?;
+    let capture_stream = provider.attach(&sandbox_id)?;
 
     // Convert captured events into hash-chained audit events, evaluate
     // policy on each, and emit through the output pipeline.
@@ -295,11 +295,26 @@ async fn cmd_watch(
         });
     }
 
-    for captured in captured_events {
+    tracing::info!("watching sandbox — press Ctrl+C to stop");
+
+    // Continuously receive events from the capture stream until shutdown.
+    loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::info!("shutdown signal received, flushing");
             break;
         }
+
+        // Block for up to 1 second waiting for an event, then re-check shutdown.
+        let captured = match capture_stream.recv_timeout(std::time::Duration::from_secs(1)) {
+            Some(ev) => ev,
+            None => {
+                // Timeout or all capture threads finished.
+                // Check if all senders have been dropped (stream exhausted).
+                // recv_timeout returns None for both timeout and disconnect;
+                // we distinguish by checking if shutdown was requested.
+                continue;
+            }
+        };
 
         let event_type_str = event_type_to_str(&captured.event_type);
         let evidence_tier = evidence_tier_for(&captured.event_type);
