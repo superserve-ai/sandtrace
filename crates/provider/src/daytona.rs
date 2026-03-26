@@ -233,7 +233,7 @@ fn watch_daytona_lifecycle(
         }
     }
 
-    let inotify = match inotify::Inotify::init() {
+    let mut inotify = match inotify::Inotify::init() {
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(error = %e, "inotify unavailable, no continuous Daytona discovery");

@@ -229,7 +229,7 @@ fn watch_e2b_lifecycle(
     }
 
     // Set up inotify on the sandboxes directory.
-    let inotify = match inotify::Inotify::init() {
+    let mut inotify = match inotify::Inotify::init() {
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(error = %e, "inotify unavailable, no continuous E2B discovery");
