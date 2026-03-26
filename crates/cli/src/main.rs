@@ -365,6 +365,24 @@ async fn cmd_watch(
         prev_hash = Some(audit_event.record_hash.clone());
         seq += 1;
 
+        // Print event to terminal in real time
+        let verdict_str = audit_event.verdict.as_ref()
+            .map(|v| format!("{}", v.result))
+            .unwrap_or_else(|| "allow".to_string());
+        let verdict_color = match verdict_str.as_str() {
+            "deny" | "block" => "\x1b[1;31m",   // red
+            "anomaly" | "flag" => "\x1b[1;33m",  // yellow
+            _ => "\x1b[1;32m",                   // green
+        };
+        let reason = audit_event.verdict.as_ref()
+            .map(|v| v.reason.as_str())
+            .unwrap_or("");
+        eprintln!(
+            "  {}{:>6}\x1b[0m  seq={:<3}  {}  {}",
+            verdict_color, verdict_str, audit_event.seq,
+            audit_event.event_type, reason
+        );
+
         stream.emit(&audit_event).await?;
         event_count += 1;
     }
