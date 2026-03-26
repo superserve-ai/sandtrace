@@ -157,6 +157,15 @@ impl SandboxProvider for DaytonaProvider {
         discover_daytona_workspaces(&self.workspaces_dir)
     }
 
+    #[cfg(target_os = "linux")]
+    fn watch_lifecycle(
+        &self,
+        tx: std::sync::mpsc::Sender<crate::LifecycleEvent>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        watch_daytona_lifecycle(&self.workspaces_dir, tx, shutdown)
+    }
+
     fn name(&self) -> &str {
         "daytona"
     }
@@ -200,6 +209,114 @@ pub fn discover_daytona_workspaces(workspaces_dir: &str) -> Result<Vec<crate::Sa
     }
 
     Ok(sandboxes)
+}
+
+/// Watch for Daytona workspace lifecycle events using inotify.
+#[cfg(target_os = "linux")]
+fn watch_daytona_lifecycle(
+    workspaces_dir: &str,
+    tx: std::sync::mpsc::Sender<crate::LifecycleEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    let base = Path::new(workspaces_dir);
+
+    let mut known: HashSet<String> = HashSet::new();
+    if let Ok(workspaces) = discover_daytona_workspaces(workspaces_dir) {
+        for info in workspaces {
+            known.insert(info.sandbox_id.clone());
+            if tx.send(crate::LifecycleEvent::Attached(info)).is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    let inotify = match inotify::Inotify::init() {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "inotify unavailable, no continuous Daytona discovery");
+            while !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            return Ok(());
+        }
+    };
+
+    let watch_mask = inotify::WatchMask::CREATE
+        | inotify::WatchMask::DELETE
+        | inotify::WatchMask::MOVED_TO
+        | inotify::WatchMask::MOVED_FROM;
+
+    if let Err(e) = inotify.watches().add(base, watch_mask) {
+        tracing::warn!(error = %e, dir = %base.display(), "failed to watch workspaces dir");
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        return Ok(());
+    }
+
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&inotify);
+    let mut buf = [0u8; 4096];
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, 500) };
+
+        if ret > 0 {
+            if let Ok(events) = inotify.read_events(&mut buf) {
+                for event in events {
+                    let name = match &event.name {
+                        Some(n) => n.to_string_lossy().to_string(),
+                        None => continue,
+                    };
+
+                    if event.mask.contains(inotify::EventMask::CREATE)
+                        || event.mask.contains(inotify::EventMask::MOVED_TO)
+                    {
+                        let ws_path = base.join(&name);
+                        if ws_path.is_dir() && !known.contains(&name) {
+                            let has_overlay = ws_path.join("overlay/upper").is_dir();
+                            let has_meta = ws_path.join("workspace.json").is_file();
+                            if has_overlay || has_meta {
+                                known.insert(name.clone());
+                                let info = crate::SandboxInfo {
+                                    sandbox_id: name.clone(),
+                                    pid: None,
+                                    provider: Box::new(DaytonaProvider {
+                                        workspaces_dir: workspaces_dir.to_string(),
+                                        ..Default::default()
+                                    }),
+                                };
+                                let _ = tx.send(crate::LifecycleEvent::Attached(info));
+                            }
+                        }
+                    }
+
+                    if event.mask.contains(inotify::EventMask::DELETE)
+                        || event.mask.contains(inotify::EventMask::MOVED_FROM)
+                    {
+                        if known.remove(&name) {
+                            let _ = tx.send(crate::LifecycleEvent::Detached {
+                                sandbox_id: name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

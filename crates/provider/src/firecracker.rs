@@ -124,7 +124,7 @@ impl SandboxProvider for FirecrackerProvider {
         let net_trace_id = trace_id.clone();
 
         let net_handle = std::thread::Builder::new()
-            .name("sandtrace-net".to_string())
+            .name(format!("st-net-{}", sandbox_id))
             .spawn(move || {
                 let config = NetworkCaptureConfig {
                     tap_device,
@@ -150,7 +150,7 @@ impl SandboxProvider for FirecrackerProvider {
         let fs_trace_id = trace_id.clone();
 
         let fs_handle = std::thread::Builder::new()
-            .name("sandtrace-fs".to_string())
+            .name(format!("st-fs-{}", sandbox_id))
             .spawn(move || {
                 let config = FsTrackingConfig {
                     sandbox_id: fs_sandbox_id,

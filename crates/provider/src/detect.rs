@@ -95,18 +95,6 @@ pub fn create_provider(kind: ProviderKind) -> Box<dyn SandboxProvider> {
     }
 }
 
-/// Discover all running sandboxes using the auto-detected provider.
-pub fn discover_all() -> anyhow::Result<Vec<crate::SandboxInfo>> {
-    let provider = create_default_provider();
-    let kind = detect_provider();
-    tracing::info!(provider = %kind, "discovering sandboxes");
-
-    let sandboxes = provider.discover()?;
-    tracing::info!(count = sandboxes.len(), provider = %kind, "discovered sandboxes");
-
-    Ok(sandboxes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
