@@ -1,4 +1,5 @@
 mod demo;
+mod pretty;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -261,9 +262,8 @@ async fn cmd_watch(
 
     // Auto-detect the sandbox provider and attach.
     let provider = sandtrace_provider::detect::create_default_provider();
-    tracing::info!(provider = provider.name(), "detected provider");
-
-    let capture_stream = provider.attach(&sandbox_id)?;
+    let provider_name = provider.name().to_string();
+    tracing::info!(provider = %provider_name, "detected provider");
 
     // Convert captured events into hash-chained audit events, evaluate
     // policy on each, and emit through the output pipeline.
@@ -295,102 +295,98 @@ async fn cmd_watch(
         });
     }
 
-    tracing::info!("watching sandbox — press Ctrl+C to stop");
+    // Start continuous streaming capture in a background thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stream_shutdown = shutdown.clone();
+    let stream_sandbox_id = sandbox_id.clone();
 
-    // Continuously receive events from the capture stream until shutdown.
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("shutdown signal received, flushing");
-            break;
-        }
-
-        // Block for up to 1 second waiting for an event, then re-check shutdown.
-        let captured = match capture_stream.recv_timeout(std::time::Duration::from_secs(1)) {
-            Some(ev) => ev,
-            None => {
-                // Timeout or all capture threads finished.
-                // Check if all senders have been dropped (stream exhausted).
-                // recv_timeout returns None for both timeout and disconnect;
-                // we distinguish by checking if shutdown was requested.
-                continue;
+    let capture_handle = std::thread::Builder::new()
+        .name("sandtrace-capture".to_string())
+        .spawn(move || {
+            if let Err(e) = provider.attach_streaming(&stream_sandbox_id, tx, stream_shutdown) {
+                tracing::error!(error = %e, "capture failed");
             }
-        };
+        })?;
 
-        let event_type_str = event_type_to_str(&captured.event_type);
-        let evidence_tier = evidence_tier_for(&captured.event_type);
+    let policy_rules = policy.as_ref().map(|p| p.rules.len()).unwrap_or(0);
+    pretty::print_banner(&sandbox_id, &provider_name, policy_rules, &output);
 
-        // Evaluate policy if available. We build a preliminary event without
-        // a verdict so policy can inspect it, then build the final event with
-        // the verdict included in the hash.
-        let verdict = if let Some(ref mut eng) = engine {
-            // V2: stateful engine evaluation (handles all rule types)
-            let tmp = sandtrace_audit_chain::build_event(
-                event_type_str,
-                &captured.agent_id,
-                &captured.trace_id,
-                seq,
-                prev_hash.clone(),
-                evidence_tier,
-                captured.payload.clone(),
-                None,
-            );
-            Some(eng.evaluate(&tmp))
-        } else {
-            policy.as_ref().map(|p| {
-                let tmp = sandtrace_audit_chain::build_event(
+    let mut stats = pretty::WatchStats::default();
+
+    // Process events as they arrive from the capture threads.
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(captured) => {
+                let event_type_str = event_type_to_str(&captured.event_type);
+                let evidence_tier = evidence_tier_for(&captured.event_type);
+
+                // Evaluate policy if available. V2 policies use the stateful
+                // PolicyEngine; V1 policies use the legacy evaluate() function.
+                let verdict = if let Some(ref mut eng) = engine {
+                    let tmp = sandtrace_audit_chain::build_event(
+                        event_type_str,
+                        &captured.agent_id,
+                        &captured.trace_id,
+                        seq,
+                        prev_hash.clone(),
+                        evidence_tier,
+                        captured.payload.clone(),
+                        None,
+                    );
+                    Some(eng.evaluate(&tmp))
+                } else {
+                    policy.as_ref().map(|p| {
+                        let tmp = sandtrace_audit_chain::build_event(
+                            event_type_str,
+                            &captured.agent_id,
+                            &captured.trace_id,
+                            seq,
+                            prev_hash.clone(),
+                            evidence_tier,
+                            captured.payload.clone(),
+                            None,
+                        );
+                        sandtrace_policy::evaluate(&tmp, p)
+                    })
+                };
+
+                let audit_event = sandtrace_audit_chain::build_event(
                     event_type_str,
                     &captured.agent_id,
                     &captured.trace_id,
                     seq,
                     prev_hash.clone(),
                     evidence_tier,
-                    captured.payload.clone(),
-                    None,
+                    captured.payload,
+                    verdict,
                 );
-                sandtrace_policy::evaluate(&tmp, p)
-            })
-        };
 
-        let audit_event = sandtrace_audit_chain::build_event(
-            event_type_str,
-            &captured.agent_id,
-            &captured.trace_id,
-            seq,
-            prev_hash.clone(),
-            evidence_tier,
-            captured.payload,
-            verdict,
-        );
+                prev_hash = Some(audit_event.record_hash.clone());
+                seq += 1;
 
-        prev_hash = Some(audit_event.record_hash.clone());
-        seq += 1;
-
-        // Print event to terminal in real time
-        let verdict_str = audit_event.verdict.as_ref()
-            .map(|v| format!("{}", v.result))
-            .unwrap_or_else(|| "allow".to_string());
-        let verdict_color = match verdict_str.as_str() {
-            "deny" | "block" => "\x1b[1;31m",   // red
-            "anomaly" | "flag" => "\x1b[1;33m",  // yellow
-            _ => "\x1b[1;32m",                   // green
-        };
-        let reason = audit_event.verdict.as_ref()
-            .map(|v| v.reason.as_str())
-            .unwrap_or("");
-        eprintln!(
-            "  {}{:>6}\x1b[0m  seq={:<3}  {}  {}",
-            verdict_color, verdict_str, audit_event.seq,
-            audit_event.event_type, reason
-        );
-
-        stream.emit(&audit_event).await?;
-        event_count += 1;
+                pretty::print_event(&audit_event);
+                stats.record(&audit_event);
+                stream.emit(&audit_event).await?;
+                event_count += 1;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("shutdown signal received, flushing");
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::info!("capture channels closed");
+                break;
+            }
+        }
     }
 
+    let _ = capture_handle.join();
     stream.flush().await?;
     stream.close().await?;
 
-    tracing::info!(event_count, "watch complete");
+    pretty::print_summary(&stats, &output);
     Ok(())
 }
 
