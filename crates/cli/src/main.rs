@@ -48,6 +48,18 @@ enum Command {
         /// Disable schema validation on output events
         #[arg(long)]
         no_validate: bool,
+
+        /// Tap device to capture network traffic from (overrides provider default)
+        #[arg(long)]
+        tap_device: Option<String>,
+
+        /// Overlay upper directory for filesystem monitoring (overrides provider default)
+        #[arg(long)]
+        overlay_dir: Option<String>,
+
+        /// Firecracker API socket path (overrides provider default)
+        #[arg(long)]
+        fc_socket: Option<String>,
     },
 
     /// Verify a JSONL audit trail for integrity and policy compliance
@@ -128,7 +140,20 @@ async fn main() -> Result<()> {
             filter_tier,
             filter_verdict,
             no_validate,
+            tap_device,
+            overlay_dir,
+            fc_socket,
         } => {
+            // Set env vars so provider detection picks them up
+            if let Some(tap) = &tap_device {
+                std::env::set_var("SANDTRACE_TAP_DEVICE", tap);
+            }
+            if let Some(dir) = &overlay_dir {
+                std::env::set_var("SANDTRACE_OVERLAY_DIR", dir);
+            }
+            if let Some(sock) = &fc_socket {
+                std::env::set_var("SANDTRACE_FC_SOCKET", sock);
+            }
             cmd_watch(
                 sandbox_id,
                 output,

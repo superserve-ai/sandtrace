@@ -82,10 +82,15 @@ pub fn create_provider(kind: ProviderKind) -> Box<dyn SandboxProvider> {
         ProviderKind::E2b => Box::new(crate::e2b::E2bProvider::default()),
         ProviderKind::Daytona => Box::new(crate::daytona::DaytonaProvider::default()),
         ProviderKind::Firecracker => Box::new(crate::firecracker::FirecrackerProvider {
-            socket_path: "/run/firecracker.socket".to_string(),
-            tap_device: "tap0".to_string(),
-            overlay_upper_dir: "/overlay/upper".to_string(),
-            jailer_pid: None,
+            socket_path: std::env::var("SANDTRACE_FC_SOCKET")
+                .unwrap_or_else(|_| "/run/firecracker.socket".to_string()),
+            tap_device: std::env::var("SANDTRACE_TAP_DEVICE")
+                .unwrap_or_else(|_| "tap0".to_string()),
+            overlay_upper_dir: std::env::var("SANDTRACE_OVERLAY_DIR")
+                .unwrap_or_else(|_| "/overlay/upper".to_string()),
+            jailer_pid: std::env::var("SANDTRACE_JAILER_PID")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         }),
     }
 }
