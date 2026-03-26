@@ -30,6 +30,15 @@ fi
 FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-1.11.0}"
 FIRECRACKER_ARCH="${FIRECRACKER_ARCH:-x86_64}"
 
+# SHA-256 checksums for Firecracker binaries (from official GitHub release tarball)
+# These are checksums of the BINARIES inside the tarball, not the tarball itself.
+# Update these when changing FIRECRACKER_VERSION.
+# Verify: download tarball, extract, sha256sum the binary.
+declare -A FC_SHA256=(
+    ["firecracker-v1.11.0-x86_64"]="8f0ea0c508d690b288079709830ca6aa037f75cea3dc9ddd48b2aa0ab0b448d5"
+    ["jailer-v1.11.0-x86_64"]="6e8d9e719e562376f9f528425724f8e3e0bc64507cb6fe98805d611c0452a528"
+)
+
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
 ALPINE_ARCH="${ALPINE_ARCH:-x86_64}"
 
@@ -141,8 +150,27 @@ ok "Rust toolchain ready ($(rustc --version 2>/dev/null || echo 'unknown'))"
 FC_RELEASE="firecracker-v${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}"
 FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/${FC_RELEASE}.tgz"
 
+verify_sha256() {
+    local file="$1" expected="$2" label="$3"
+    if [[ -z "$expected" ]]; then
+        warn "No checksum configured for $label — skipping verification"
+        return 0
+    fi
+    local actual
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        die "SHA-256 mismatch for $label: expected $expected, got $actual"
+    fi
+    ok "SHA-256 verified for $label"
+}
+
+FC_BIN_KEY="firecracker-v${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}"
+JAILER_BIN_KEY="jailer-v${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}"
+
 if command_exists firecracker && firecracker --version 2>/dev/null | grep -q "$FIRECRACKER_VERSION"; then
-    ok "Firecracker v${FIRECRACKER_VERSION} already installed"
+    # Verify existing install
+    info "Firecracker v${FIRECRACKER_VERSION} found, verifying checksum..."
+    verify_sha256 "$(command -v firecracker)" "${FC_SHA256[$FC_BIN_KEY]:-}" "firecracker"
 else
     info "Installing Firecracker v${FIRECRACKER_VERSION}..."
     TMP_FC="$(mktemp -d)"
@@ -151,10 +179,13 @@ else
 
     # The tarball extracts to release-v<ver>-<arch>/ with binaries inside
     FC_EXTRACTED="$TMP_FC/release-v${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}"
-    install -m 0755 "$FC_EXTRACTED/firecracker-v${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}" \
-        "$FC_BIN_DIR/firecracker"
-    install -m 0755 "$FC_EXTRACTED/jailer-v${FIRECRACKER_VERSION}-${FIRECRACKER_ARCH}" \
-        "$FC_BIN_DIR/jailer"
+
+    # Verify before installing
+    verify_sha256 "$FC_EXTRACTED/$FC_BIN_KEY" "${FC_SHA256[$FC_BIN_KEY]:-}" "firecracker"
+    verify_sha256 "$FC_EXTRACTED/$JAILER_BIN_KEY" "${FC_SHA256[$JAILER_BIN_KEY]:-}" "jailer"
+
+    install -m 0755 "$FC_EXTRACTED/$FC_BIN_KEY" "$FC_BIN_DIR/firecracker"
+    install -m 0755 "$FC_EXTRACTED/$JAILER_BIN_KEY" "$FC_BIN_DIR/jailer"
     rm -rf "$TMP_FC"
     ok "Firecracker v${FIRECRACKER_VERSION} installed to $FC_BIN_DIR"
 fi
