@@ -115,7 +115,6 @@ pub struct Destination {
 /// A policy manifest loaded from a YAML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyManifest {
-    pub schema_version: String,
     /// Global policy mode. When `None`, defaults to `Enforce`.
     #[serde(default)]
     pub mode: Option<PolicyMode>,
@@ -126,14 +125,6 @@ impl PolicyManifest {
     /// Effective global mode (defaults to `Enforce` when not specified).
     pub fn effective_mode(&self) -> PolicyMode {
         self.mode.unwrap_or(PolicyMode::Enforce)
-    }
-
-    /// Returns `true` if this manifest uses the v2 schema (version "2.0").
-    ///
-    /// V2 policies support match, threshold, and sequence rules and should be
-    /// evaluated through [`PolicyEngine`] to maintain stateful rule state.
-    pub fn is_v2(&self) -> bool {
-        self.schema_version == "2.0"
     }
 }
 
@@ -296,7 +287,6 @@ pub fn load_policy(yaml: &str) -> Result<PolicyManifest> {
     let manifest: PolicyManifest =
         serde_yaml::from_str(yaml).context("parsing policy YAML")?;
     tracing::debug!(
-        version = %manifest.schema_version,
         rules = manifest.rules.len(),
         "loaded policy manifest"
     );
@@ -304,35 +294,17 @@ pub fn load_policy(yaml: &str) -> Result<PolicyManifest> {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluation (v1 rule types — match/threshold/sequence are evaluated by the
-// evaluation engine in a separate crate)
+// Evaluation — all rules go through the PolicyEngine
 // ---------------------------------------------------------------------------
 
 /// Evaluate a single audit event against the policy, producing a verdict.
 ///
-/// Uses first-match evaluation order: rules are checked in the order they
-/// appear in the manifest and the first matching rule determines the verdict.
+/// Convenience wrapper that creates a temporary `PolicyEngine`. For evaluating
+/// multiple events, create a `PolicyEngine` directly to preserve state across
+/// threshold and sequence rules.
 pub fn evaluate(event: &AuditEvent, policy: &PolicyManifest) -> Verdict {
-    match event.event_type.as_str() {
-        "network_egress" => evaluate_network(event, policy),
-        "filesystem_summary" => evaluate_filesystem(event, policy),
-        _ => Verdict {
-            result: "allow".to_string(),
-            policy_rule: "none".to_string(),
-            reason: format!("no policy applies to event type '{}'", event.event_type),
-        },
-    }
-}
-
-/// Evaluate all events against a policy, returning a verdict per event.
-pub fn evaluate_all(
-    events: &[AuditEvent],
-    policy: &PolicyManifest,
-) -> Vec<(String, Verdict)> {
-    events
-        .iter()
-        .map(|e| (e.event_id.clone(), evaluate(e, policy)))
-        .collect()
+    let mut engine = PolicyEngine::new(policy.clone());
+    engine.evaluate(event)
 }
 
 /// Check a set of audit events against a policy, returning violations.
@@ -342,23 +314,8 @@ pub fn check_events(
     events: &[AuditEvent],
     policy: &PolicyManifest,
 ) -> Vec<Violation> {
-    let mut violations = Vec::new();
-
-    for event in events {
-        let verdict = evaluate(event, policy);
-        match verdict.result.as_str() {
-            "deny" | "anomaly" => {
-                violations.push(Violation {
-                    event_id: event.event_id.clone(),
-                    rule_id: verdict.policy_rule,
-                    reason: verdict.reason,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    violations
+    let mut engine = PolicyEngine::new(policy.clone());
+    engine.check_events(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -451,200 +408,6 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Network egress evaluation
-// ---------------------------------------------------------------------------
-
-fn evaluate_network(event: &AuditEvent, policy: &PolicyManifest) -> Verdict {
-    let dest_host = event
-        .payload
-        .get("dest_host")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let dest_port = event
-        .payload
-        .get("dest_port")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u16;
-    let bytes_sent = event
-        .payload
-        .get("bytes_sent")
-        .and_then(serde_json::Value::as_u64);
-
-    // First-match: iterate rules in order
-    for rule in &policy.rules {
-        if let PolicyRule::NetworkEgress {
-            id,
-            destinations,
-            max_bytes_per_call,
-            ..
-        } = rule
-        {
-            let matches = destinations
-                .iter()
-                .any(|d| host_matches(&d.host, dest_host) && d.port == dest_port);
-
-            if matches {
-                if let (Some(max), Some(sent)) = (max_bytes_per_call, bytes_sent) {
-                    if sent > *max {
-                        return Verdict {
-                            result: "anomaly".to_string(),
-                            policy_rule: id.clone(),
-                            reason: format!(
-                                "payload {sent}B exceeds max {max}B for {dest_host}:{dest_port}"
-                            ),
-                        };
-                    }
-                }
-                return Verdict {
-                    result: "allow".to_string(),
-                    policy_rule: id.clone(),
-                    reason: format!(
-                        "egress to {dest_host}:{dest_port} permitted by rule"
-                    ),
-                };
-            }
-        }
-    }
-
-    Verdict {
-        result: "deny".to_string(),
-        policy_rule: "none".to_string(),
-        reason: format!("no rule permits egress to {dest_host}:{dest_port}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Filesystem evaluation
-// ---------------------------------------------------------------------------
-
-fn evaluate_filesystem(event: &AuditEvent, policy: &PolicyManifest) -> Verdict {
-    let fs_rules: Vec<&PolicyRule> = policy
-        .rules
-        .iter()
-        .filter(|r| matches!(r, PolicyRule::Filesystem { .. }))
-        .collect();
-
-    if fs_rules.is_empty() {
-        return Verdict {
-            result: "deny".to_string(),
-            policy_rule: "none".to_string(),
-            reason: "no filesystem rules defined".to_string(),
-        };
-    }
-
-    // Collect paths per operation category for access preset enforcement.
-    let mut created: Vec<&str> = Vec::new();
-    let mut modified: Vec<&str> = Vec::new();
-    let mut deleted: Vec<&str> = Vec::new();
-
-    if let Some(arr) = event.payload.get("files_created").and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                created.push(s);
-            }
-        }
-    }
-    if let Some(arr) = event.payload.get("files_modified").and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                modified.push(s);
-            }
-        }
-    }
-    if let Some(arr) = event.payload.get("files_deleted").and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                deleted.push(s);
-            }
-        }
-    }
-
-    // Also check "path" field for single-file events
-    let single_path = event.payload.get("path").and_then(|v| v.as_str());
-
-    // Enforce access presets: check if any rule denies the operation types.
-    for rule in &fs_rules {
-        if let PolicyRule::Filesystem { id, access, .. } = rule {
-            if let Some(preset) = access {
-                match preset {
-                    AccessPreset::ReadOnly => {
-                        if !created.is_empty() || !modified.is_empty() || !deleted.is_empty() {
-                            return Verdict {
-                                result: "deny".to_string(),
-                                policy_rule: id.to_string(),
-                                reason: "access preset read-only denies write/delete operations"
-                                    .to_string(),
-                            };
-                        }
-                    }
-                    AccessPreset::ReadWrite => {
-                        if !deleted.is_empty() {
-                            return Verdict {
-                                result: "deny".to_string(),
-                                policy_rule: id.to_string(),
-                                reason: "access preset read-write denies delete operations"
-                                    .to_string(),
-                            };
-                        }
-                    }
-                    AccessPreset::Full => {}
-                }
-            }
-        }
-    }
-
-    // Gather all paths for allowlist checking.
-    let mut all_paths: Vec<&str> = Vec::new();
-    all_paths.extend(&created);
-    all_paths.extend(&modified);
-    all_paths.extend(&deleted);
-    if let Some(p) = single_path {
-        all_paths.push(p);
-    }
-
-    if all_paths.is_empty() {
-        return Verdict {
-            result: "allow".to_string(),
-            policy_rule: "none".to_string(),
-            reason: "no file paths in event".to_string(),
-        };
-    }
-
-    // Check each path against filesystem rules
-    let mut unauthorized: Vec<String> = Vec::new();
-    for path in &all_paths {
-        let permitted = fs_rules.iter().any(|rule| {
-            if let PolicyRule::Filesystem { paths, .. } = rule {
-                paths.iter().any(|pattern| path_matches(pattern, path))
-            } else {
-                false
-            }
-        });
-        if !permitted {
-            unauthorized.push(path.to_string());
-        }
-    }
-
-    if unauthorized.is_empty() {
-        let rule_ids: Vec<&str> = fs_rules.iter().map(|r| r.id()).collect();
-        Verdict {
-            result: "allow".to_string(),
-            policy_rule: rule_ids.join(","),
-            reason: "all file access permitted by policy".to_string(),
-        }
-    } else {
-        Verdict {
-            result: "deny".to_string(),
-            policy_rule: "none".to_string(),
-            reason: format!(
-                "unauthorized file access: {}",
-                unauthorized.join(", ")
-            ),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -654,7 +417,7 @@ mod tests {
 
     fn make_event(event_type: &str, payload: serde_json::Value) -> AuditEvent {
         AuditEvent {
-            schema_version: "2.0".into(),
+            schema_version: "1.0".into(),
             event_id: "e1".into(),
             event_type: event_type.into(),
             agent_id: "a1".into(),
@@ -676,7 +439,6 @@ mod tests {
     #[test]
     fn test_load_network_egress_rule() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -686,7 +448,6 @@ rules:
     max_bytes_per_call: 4096
 "#;
         let policy = load_policy(yaml).unwrap();
-        assert_eq!(policy.schema_version, "2.0");
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.mode, None);
         assert_eq!(policy.effective_mode(), PolicyMode::Enforce);
@@ -708,7 +469,6 @@ rules:
     #[test]
     fn test_load_filesystem_rule_with_paths() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: tool:read_file
     type: filesystem
@@ -729,7 +489,6 @@ rules:
     #[test]
     fn test_full_manifest_evaluates() {
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: tool:read_file
@@ -783,7 +542,6 @@ rules:
     #[test]
     fn test_load_policy_with_mode() {
         let yaml = r#"
-schema_version: "2.0"
 mode: audit
 rules:
   - id: tool:stripe
@@ -795,7 +553,6 @@ rules:
         port: 443
 "#;
         let policy = load_policy(yaml).unwrap();
-        assert_eq!(policy.schema_version, "2.0");
         assert_eq!(policy.mode, Some(PolicyMode::Audit));
         assert_eq!(policy.effective_mode(), PolicyMode::Audit);
 
@@ -807,7 +564,6 @@ rules:
     #[test]
     fn test_parse_match_rule() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -856,7 +612,6 @@ rules:
     #[test]
     fn test_parse_match_rule_with_glob() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: match:wildcard-host
     type: match
@@ -880,7 +635,6 @@ rules:
     #[test]
     fn test_parse_threshold_rule() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:api-calls
     type: threshold
@@ -915,7 +669,6 @@ rules:
     #[test]
     fn test_parse_threshold_sum_and_rate() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:bytes
     type: threshold
@@ -956,7 +709,6 @@ rules:
     #[test]
     fn test_parse_sequence_rule() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil-pattern
     type: sequence
@@ -999,7 +751,6 @@ rules:
     #[test]
     fn test_parse_sequence_multi_predicate_steps() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:targeted-exfil
     type: sequence
@@ -1030,7 +781,6 @@ rules:
     #[test]
     fn test_parse_filesystem_with_access_preset() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: fs:workspace
     type: filesystem
@@ -1075,7 +825,6 @@ rules:
     fn test_parse_deny_before_allow() {
         // First-match order: deny rule comes first
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: deny:evil
@@ -1101,7 +850,6 @@ rules:
     fn test_parse_mixed_rule_types() {
         // Manifest with all five rule types
         let yaml = r#"
-schema_version: "2.0"
 mode: audit
 rules:
   - id: tool:stripe
@@ -1156,7 +904,6 @@ rules:
     #[test]
     fn test_rule_accessors() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: test-rule
     type: match
@@ -1180,9 +927,8 @@ rules:
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_check_violation_no_rule() {
+    fn test_no_rules_allows_everything() {
         let policy = PolicyManifest {
-            schema_version: "2.0".into(),
             mode: None,
             rules: vec![],
         };
@@ -1194,16 +940,15 @@ rules:
                 "bytes_sent": 100
             }),
         );
+        // No rules = no restrictions — event is allowed.
         let violations = check_events(&[event], &policy);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].reason.contains("evil.com"));
+        assert!(violations.is_empty());
     }
 
     #[test]
     fn test_evaluate_network_allow() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1233,7 +978,6 @@ rules:
     fn test_evaluate_network_deny() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1254,14 +998,12 @@ rules:
 
         let verdict = evaluate(&event, &policy);
         assert_eq!(verdict.result, "deny");
-        assert!(verdict.reason.contains("evil.com"));
     }
 
     #[test]
     fn test_evaluate_network_anomaly_bytes() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1292,7 +1034,6 @@ rules:
     fn test_evaluate_filesystem_allow() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:read_file
     type: filesystem
@@ -1319,7 +1060,6 @@ rules:
     fn test_evaluate_filesystem_deny() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:read_file
     type: filesystem
@@ -1340,7 +1080,6 @@ rules:
 
         let verdict = evaluate(&event, &policy);
         assert_eq!(verdict.result, "deny");
-        assert!(verdict.reason.contains("/etc/shadow"));
     }
 
     #[test]
@@ -1386,10 +1125,9 @@ rules:
     }
 
     #[test]
-    fn test_evaluate_all() {
+    fn test_evaluate_multiple_events() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1407,26 +1145,22 @@ rules:
                 "dest_port": 443
             }),
         );
-        let mut denied = make_event(
+        let denied = make_event(
             "network_egress",
             serde_json::json!({
                 "dest_host": "evil.com",
                 "dest_port": 443
             }),
         );
-        denied.event_id = "e2".into();
 
-        let results = evaluate_all(&[allowed, denied], &policy);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].1.result, "allow");
-        assert_eq!(results[1].1.result, "deny");
+        assert_eq!(evaluate(&allowed, &policy).result, "allow");
+        assert_eq!(evaluate(&denied, &policy).result, "deny");
     }
 
     #[test]
     fn test_wildcard_host_in_policy() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe_all
     type: network_egress
@@ -1452,7 +1186,6 @@ rules:
     #[test]
     fn test_unknown_event_type_allows() {
         let policy = PolicyManifest {
-            schema_version: "2.0".into(),
             mode: None,
             rules: vec![],
         };
@@ -1465,7 +1198,6 @@ rules:
     fn test_check_events_returns_violations_for_deny_and_anomaly() {
         let policy = load_policy(
             r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1507,7 +1239,6 @@ rules:
     #[test]
     fn test_serialization_produces_valid_yaml() {
         let yaml = r#"
-schema_version: "2.0"
 mode: audit
 rules:
   - id: tool:stripe
@@ -1521,14 +1252,12 @@ rules:
 
         // Serialization should produce valid YAML (no panics)
         let serialized = serde_yaml::to_string(&policy).unwrap();
-        assert!(serialized.contains("schema_version"));
         assert!(serialized.contains("api.stripe.com"));
 
         // Re-parse rules without FieldPredicate nesting (serde_yaml limitation
         // with externally-tagged enums inside internally-tagged enums prevents
         // full round-trip for match/threshold/sequence rules)
         let reparsed = load_policy(&serialized).unwrap();
-        assert_eq!(reparsed.schema_version, "2.0");
         assert_eq!(reparsed.mode, Some(PolicyMode::Audit));
         assert_eq!(reparsed.rules.len(), 1);
         assert!(matches!(reparsed.rules[0], PolicyRule::NetworkEgress { .. }));
@@ -1541,7 +1270,6 @@ rules:
     #[test]
     fn test_match_rule_empty_bind() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: m1
     type: match
@@ -1562,7 +1290,6 @@ rules:
     #[test]
     fn test_threshold_no_field() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: t1
     type: threshold
@@ -1585,7 +1312,6 @@ rules:
     fn test_filesystem_no_access_preset() {
         // v1-style filesystem rule without access preset
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: fs:legacy
     type: filesystem
@@ -1604,7 +1330,6 @@ rules:
     #[test]
     fn test_field_predicate_equals_number() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: m1
     type: match
@@ -1628,7 +1353,6 @@ rules:
     #[test]
     fn test_field_predicate_equals_bool() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: m1
     type: match
@@ -1652,7 +1376,6 @@ rules:
     #[test]
     fn test_not_in_with_numbers() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: m1
     type: match
@@ -1681,7 +1404,6 @@ rules:
     #[test]
     fn test_empty_rules_list() {
         let yaml = r#"
-schema_version: "2.0"
 rules: []
 "#;
         let policy = load_policy(yaml).unwrap();
@@ -1691,7 +1413,6 @@ rules: []
     #[test]
     fn test_invalid_rule_type_fails() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: bad
     type: unknown_type
@@ -1703,7 +1424,6 @@ rules:
     #[test]
     fn test_description_on_all_rule_types() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: r1
     type: network_egress

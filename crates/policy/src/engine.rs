@@ -1,4 +1,4 @@
-//! Stateful v2 evaluation engine for match, threshold, and sequence rules.
+//! Stateful evaluation engine for all policy rule types.
 //!
 //! The engine maintains per-rule state (event buffers for threshold rules,
 //! partial-match trackers for sequence rules) and evaluates events in
@@ -766,7 +766,7 @@ mod tests {
 
     fn make_event(event_type: &str, payload: serde_json::Value) -> AuditEvent {
         AuditEvent {
-            schema_version: "2.0".into(),
+            schema_version: "1.0".into(),
             event_id: "e1".into(),
             event_type: event_type.into(),
             agent_id: "a1".into(),
@@ -870,7 +870,6 @@ mod tests {
     #[test]
     fn test_match_rule_deny() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -900,7 +899,6 @@ rules:
     #[test]
     fn test_match_rule_no_match() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -928,7 +926,6 @@ rules:
     #[test]
     fn test_match_rule_glob_predicate() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:wildcard
     type: match
@@ -952,7 +949,6 @@ rules:
     #[test]
     fn test_match_first_match_order() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:evil
     type: match
@@ -996,7 +992,6 @@ rules:
     #[test]
     fn test_threshold_count() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:calls
     type: threshold
@@ -1035,7 +1030,6 @@ rules:
     #[test]
     fn test_threshold_sum() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:bytes
     type: threshold
@@ -1070,7 +1064,6 @@ rules:
     #[test]
     fn test_threshold_window_expiry() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: rate:calls
     type: threshold
@@ -1108,7 +1101,6 @@ rules:
     #[test]
     fn test_sequence_fires() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil
     type: sequence
@@ -1148,7 +1140,6 @@ rules:
     #[test]
     fn test_sequence_window_expired() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil
     type: sequence
@@ -1186,7 +1177,6 @@ rules:
     #[test]
     fn test_sequence_resets_after_fire() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:exfil
     type: sequence
@@ -1226,7 +1216,6 @@ rules:
     #[test]
     fn test_sequence_three_steps() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: seq:three-step
     type: sequence
@@ -1262,7 +1251,6 @@ rules:
     #[test]
     fn test_audit_mode_global() {
         let yaml = r#"
-schema_version: "2.0"
 mode: audit
 rules:
   - id: deny:evil
@@ -1289,7 +1277,6 @@ rules:
     #[test]
     fn test_enforce_mode_per_rule_override() {
         let yaml = r#"
-schema_version: "2.0"
 mode: audit
 rules:
   - id: deny:evil
@@ -1316,7 +1303,6 @@ rules:
     #[test]
     fn test_audit_mode_per_rule() {
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: deny:evil
@@ -1347,7 +1333,6 @@ rules:
     #[test]
     fn test_engine_network_allow() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1370,7 +1355,6 @@ rules:
     #[test]
     fn test_engine_network_deny_no_match() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1392,7 +1376,6 @@ rules:
     #[test]
     fn test_engine_filesystem() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: fs:workspace
     type: filesystem
@@ -1421,7 +1404,6 @@ rules:
     #[test]
     fn test_mixed_rules_first_match() {
         let yaml = r#"
-schema_version: "2.0"
 rules:
   - id: deny:exfil
     type: match
@@ -1468,7 +1450,6 @@ rules:
         // Reproduce bug st-0o7: filesystem rule with match/sequence/threshold
         // before it should still evaluate correctly.
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: deny:unknown-egress
@@ -1553,7 +1534,6 @@ rules:
     #[test]
     fn test_engine_filesystem_readonly_denies_writes() {
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: fs:readonly
@@ -1607,7 +1587,6 @@ rules:
     #[test]
     fn test_engine_filesystem_readwrite_denies_deletes() {
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: fs:workspace
@@ -1650,7 +1629,6 @@ rules:
     #[test]
     fn test_engine_filesystem_full_allows_all() {
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: fs:full
@@ -1681,7 +1659,6 @@ rules:
         // Regression: v2 should allow filesystem_summary with no file paths
         // (consistent with v1 behavior), not fall through to default deny.
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules:
   - id: fs:workspace
@@ -1711,7 +1688,6 @@ rules:
     #[test]
     fn test_unknown_event_type_in_enforce() {
         let yaml = r#"
-schema_version: "2.0"
 mode: enforce
 rules: []
 "#;

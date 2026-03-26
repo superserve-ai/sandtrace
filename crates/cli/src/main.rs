@@ -232,24 +232,10 @@ async fn cmd_watch(
 ) -> Result<()> {
     tracing::info!(sandbox_id, "attaching to sandbox");
 
-    // Auto-detect schema version and create the appropriate evaluator.
-    // V2 policies use the stateful PolicyEngine (supports match/threshold/sequence).
-    // V1 policies use the legacy stateless evaluate() function.
-    let mut engine = policy.as_ref().and_then(|p| {
-        if p.is_v2() {
-            tracing::info!(rules = p.rules.len(), "loaded v2 policy engine");
-            Some(sandtrace_policy::PolicyEngine::new(p.clone()))
-        } else {
-            tracing::info!(rules = p.rules.len(), "loaded v1 policy");
-            None
-        }
+    let mut engine = policy.as_ref().map(|p| {
+        tracing::info!(rules = p.rules.len(), "loaded policy engine");
+        sandtrace_policy::PolicyEngine::new(p.clone())
     });
-
-    if engine.is_none() {
-        if let Some(p) = &policy {
-            tracing::info!(rules = p.rules.len(), "loaded policy");
-        }
-    }
 
     let sink = sandtrace_output::OutputSink::from_target(&output).await?;
     let filter = build_filter(filter_type, filter_tier, filter_verdict);
@@ -320,9 +306,7 @@ async fn cmd_watch(
                 let event_type_str = event_type_to_str(&captured.event_type);
                 let evidence_tier = evidence_tier_for(&captured.event_type);
 
-                // Evaluate policy if available. V2 policies use the stateful
-                // PolicyEngine; V1 policies use the legacy evaluate() function.
-                let verdict = if let Some(ref mut eng) = engine {
+                let verdict = engine.as_mut().map(|eng| {
                     let tmp = sandtrace_audit_chain::build_event(
                         event_type_str,
                         &captured.agent_id,
@@ -333,22 +317,8 @@ async fn cmd_watch(
                         captured.payload.clone(),
                         None,
                     );
-                    Some(eng.evaluate(&tmp))
-                } else {
-                    policy.as_ref().map(|p| {
-                        let tmp = sandtrace_audit_chain::build_event(
-                            event_type_str,
-                            &captured.agent_id,
-                            &captured.trace_id,
-                            seq,
-                            prev_hash.clone(),
-                            evidence_tier,
-                            captured.payload.clone(),
-                            None,
-                        );
-                        sandtrace_policy::evaluate(&tmp, p)
-                    })
-                };
+                    eng.evaluate(&tmp)
+                });
 
                 let audit_event = sandtrace_audit_chain::build_event(
                     event_type_str,
@@ -423,23 +393,14 @@ async fn cmd_stream(
 
     let mut events = sandtrace_audit_chain::read_jsonl(&path)?;
 
-    // When a policy is provided, re-evaluate verdicts through the appropriate
-    // engine so that stream output reflects the current policy (not stale
-    // verdicts baked into the JSONL file).
+    // Re-evaluate verdicts through the policy engine so that stream output
+    // reflects the current policy (not stale verdicts baked into the JSONL file).
     if let Some(ref p) = policy {
-        if p.is_v2() {
-            tracing::info!("applying v2 policy evaluation to stream");
-            let mut engine = sandtrace_policy::PolicyEngine::new(p.clone());
-            for event in &mut events {
-                let verdict = engine.evaluate(event);
-                event.verdict = Some(verdict);
-            }
-        } else {
-            tracing::info!("applying v1 policy evaluation to stream");
-            for event in &mut events {
-                let verdict = sandtrace_policy::evaluate(event, p);
-                event.verdict = Some(verdict);
-            }
+        tracing::info!("applying policy evaluation to stream");
+        let mut engine = sandtrace_policy::PolicyEngine::new(p.clone());
+        for event in &mut events {
+            let verdict = engine.evaluate(event);
+            event.verdict = Some(verdict);
         }
     }
 
@@ -467,15 +428,11 @@ fn cmd_verify(
     let events = sandtrace_audit_chain::read_jsonl(&path)?;
     let chain_result = sandtrace_audit_chain::verify_chain(&events)?;
 
-    // Auto-detect schema version: v2 uses stateful engine (threshold/sequence
-    // state accumulates across events), v1 uses legacy stateless evaluator.
     let violations = match &policy {
-        Some(p) if p.is_v2() => {
-            tracing::info!("using v2 policy engine for verification");
+        Some(p) => {
             let mut engine = sandtrace_policy::PolicyEngine::new(p.clone());
             engine.check_events(&events)
         }
-        Some(p) => sandtrace_policy::check_events(&events, p),
         None => Vec::new(),
     };
 
