@@ -181,6 +181,15 @@ impl SandboxProvider for FirecrackerProvider {
         discover_firecracker_vms()
     }
 
+    #[cfg(target_os = "linux")]
+    fn watch_lifecycle(
+        &self,
+        tx: std::sync::mpsc::Sender<crate::LifecycleEvent>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        watch_firecracker_lifecycle(tx, shutdown)
+    }
+
     fn name(&self) -> &str {
         "firecracker"
     }
@@ -228,19 +237,35 @@ pub fn discover_firecracker_vms() -> Result<Vec<crate::SandboxInfo>> {
             None => continue,
         };
 
-        // Derive sandbox_id from socket path
-        let sandbox_id = std::path::Path::new(&socket_path)
-            .parent()
-            .and_then(|p| p.file_name())
+        // Derive sandbox_id: prefer socket filename (without extension),
+        // then parent dir name, then fall back to fc-{pid}.
+        let sock_path = std::path::Path::new(&socket_path);
+        let sandbox_id = sock_path
+            .file_stem()
             .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| n != "api" && n != "firecracker" && !n.is_empty())
+            .or_else(|| {
+                sock_path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| n != "tmp" && n != "run" && !n.is_empty())
+            })
             .unwrap_or_else(|| format!("fc-{pid}"));
 
-        // Try to query Firecracker API for tap device
-        let tap_device = query_fc_tap_device(&socket_path)
-            .unwrap_or_else(|_| format!("tap{}", sandboxes.len()));
+        // Try to query Firecracker API for tap device (best-effort).
+        let tap_device = query_fc_tap_device(&socket_path).unwrap_or_else(|| {
+            let fallback = format!("tap{}", sandboxes.len());
+            tracing::debug!(
+                socket = %socket_path,
+                fallback = %fallback,
+                "could not query Firecracker API for tap device"
+            );
+            fallback
+        });
 
-        // Derive overlay dir from socket dir convention
-        let overlay_upper_dir = std::path::Path::new(&socket_path)
+        // Derive overlay dir from socket dir convention.
+        let overlay_upper_dir = sock_path
             .parent()
             .map(|p| p.join("overlay/upper").to_string_lossy().to_string())
             .unwrap_or_else(|| "/overlay/upper".to_string());
@@ -255,6 +280,7 @@ pub fn discover_firecracker_vms() -> Result<Vec<crate::SandboxInfo>> {
 
         sandboxes.push(crate::SandboxInfo {
             sandbox_id,
+            pid: Some(pid),
             provider: Box::new(FirecrackerProvider {
                 socket_path,
                 tap_device,
@@ -273,33 +299,162 @@ pub fn discover_firecracker_vms() -> Result<Vec<crate::SandboxInfo>> {
 }
 
 /// Query the Firecracker API via Unix socket to get the tap device name.
+/// Returns `None` on any failure (connection refused, timeout, parse error).
 #[cfg(target_os = "linux")]
-fn query_fc_tap_device(socket_path: &str) -> Result<String> {
+fn query_fc_tap_device(socket_path: &str) -> Option<String> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok()?;
 
     let request = "GET /network-interfaces HTTP/1.0\r\nHost: localhost\r\n\r\n";
-    stream.write_all(request.as_bytes())?;
+    stream.write_all(request.as_bytes()).ok()?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+
+    let response = String::from_utf8_lossy(&response);
 
     // Parse HTTP response — find the JSON body after \r\n\r\n
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("no body in API response"))?;
+    let body = response.split("\r\n\r\n").nth(1)?;
 
-    let ifaces: serde_json::Value = serde_json::from_str(body)?;
-    let tap = ifaces
+    let ifaces: serde_json::Value = serde_json::from_str(body).ok()?;
+    ifaces
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|iface| iface.get("host_dev_name"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no host_dev_name in network interfaces"))?;
+        .map(|s| s.to_string())
+}
 
-    Ok(tap.to_string())
+// ---------------------------------------------------------------------------
+// Event-driven lifecycle watcher (Linux only)
+// ---------------------------------------------------------------------------
+
+/// Watch for Firecracker VM lifecycle events using pidfd for process death
+/// detection. Does an initial /proc scan, then monitors each discovered
+/// process via pidfd. Re-scans periodically (10s) to catch new VMs.
+#[cfg(target_os = "linux")]
+fn watch_firecracker_lifecycle(
+    tx: std::sync::mpsc::Sender<crate::LifecycleEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    /// How often to re-scan /proc for new VMs (seconds).
+    const RESCAN_INTERVAL_SECS: u64 = 10;
+
+    struct TrackedVm {
+        sandbox_id: String,
+        pidfd: Option<std::os::fd::OwnedFd>,
+    }
+
+    let mut tracked: HashMap<u32, TrackedVm> = HashMap::new();
+    // Force immediate scan on first iteration.
+    let mut last_scan = std::time::Instant::now()
+        - std::time::Duration::from_secs(RESCAN_INTERVAL_SECS + 1);
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Periodic scan for new VMs.
+        if last_scan.elapsed() >= std::time::Duration::from_secs(RESCAN_INTERVAL_SECS) {
+            if let Ok(discovered) = discover_firecracker_vms() {
+                for info in discovered {
+                    let pid = match info.pid {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    if tracked.contains_key(&pid) {
+                        continue;
+                    }
+
+                    let pidfd = open_pidfd(pid);
+                    if pidfd.is_none() {
+                        tracing::debug!(pid, "pidfd unavailable, using /proc fallback");
+                    }
+
+                    let sandbox_id = info.sandbox_id.clone();
+                    tracked.insert(
+                        pid,
+                        TrackedVm {
+                            sandbox_id: sandbox_id.clone(),
+                            pidfd,
+                        },
+                    );
+
+                    if tx.send(crate::LifecycleEvent::Attached(info)).is_err() {
+                        return Ok(());
+                    }
+                    tracing::info!(sandbox_id = %sandbox_id, pid, "attached to VM");
+                }
+            }
+            last_scan = std::time::Instant::now();
+        }
+
+        // Check for dead VMs via pidfd (instant) or /proc fallback.
+        let mut dead_pids = Vec::new();
+        for (pid, vm) in &tracked {
+            let is_dead = if let Some(ref fd) = vm.pidfd {
+                let mut pollfd = libc::pollfd {
+                    fd: std::os::fd::AsRawFd::as_raw_fd(fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
+                ret > 0 && (pollfd.revents & libc::POLLIN) != 0
+            } else {
+                !std::path::Path::new(&format!("/proc/{pid}")).exists()
+            };
+
+            if is_dead {
+                dead_pids.push(*pid);
+            }
+        }
+
+        for pid in dead_pids {
+            if let Some(vm) = tracked.remove(&pid) {
+                tracing::info!(sandbox_id = %vm.sandbox_id, pid, "VM exited");
+                let _ = tx.send(crate::LifecycleEvent::Detached {
+                    sandbox_id: vm.sandbox_id,
+                });
+            }
+        }
+
+        // Sleep briefly — pidfd poll is non-blocking, this just paces the loop.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    Ok(())
+}
+
+/// Open a pidfd for the given process (Linux 5.3+).
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) };
+    if fd >= 0 {
+        Some(unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+    } else {
+        None
+    }
 }

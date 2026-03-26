@@ -1,6 +1,8 @@
 mod demo;
 mod pretty;
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -256,39 +258,12 @@ async fn cmd_watch(
 
     tracing::info!(output, "output pipeline ready");
 
-    // Determine which sandboxes to watch.
+    // Determine provider.
     let provider = sandtrace_provider::detect::create_default_provider();
     let provider_name = provider.name().to_string();
     tracing::info!(provider = %provider_name, "detected provider");
 
-    let sandbox_infos: Vec<sandtrace_provider::SandboxInfo> = match sandbox_id {
-        Some(ref id) => {
-            tracing::info!(sandbox_id = %id, "single sandbox mode");
-            vec![sandtrace_provider::SandboxInfo {
-                sandbox_id: id.clone(),
-                provider,
-            }]
-        }
-        None => {
-            let discovered = sandtrace_provider::detect::discover_all()?;
-            if discovered.is_empty() {
-                anyhow::bail!(
-                    "no running sandboxes found for provider '{}'. \
-                     Use --sandbox-id to specify one explicitly.",
-                    provider_name
-                );
-            }
-            discovered
-        }
-    };
-
-    let sandbox_ids: Vec<String> = sandbox_infos.iter().map(|s| s.sandbox_id.clone()).collect();
-    let multi = sandbox_ids.len() > 1;
-
-    // Convert captured events into hash-chained audit events, evaluate
-    // policy on each, and emit through the output pipeline.
-    let mut seq: u64 = 1;
-    let mut prev_hash: Option<String> = None;
+    let single_mode = sandbox_id.is_some();
 
     // Set up a shutdown flag triggered by SIGINT/SIGTERM.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -314,42 +289,81 @@ async fn cmd_watch(
         });
     }
 
-    // Spawn one capture thread per sandbox, all feeding the same channel.
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Two channels: lifecycle events (attach/detach) and capture events.
+    let (capture_tx, capture_rx) = std::sync::mpsc::channel();
+    let (lifecycle_tx, lifecycle_rx) = std::sync::mpsc::channel();
+    let mut tracker = SandboxTracker::new();
 
-    let mut capture_handles = Vec::new();
-    for info in sandbox_infos {
-        let thread_tx = tx.clone();
-        let thread_shutdown = shutdown.clone();
-        let thread_sandbox_id = info.sandbox_id.clone();
+    let multi = !single_mode;
 
-        let handle = std::thread::Builder::new()
-            .name(format!("sandtrace-{}", info.sandbox_id))
+    if single_mode {
+        // Single-VM mode: attach directly, no lifecycle watcher.
+        let info = sandtrace_provider::SandboxInfo {
+            sandbox_id: sandbox_id.unwrap(),
+            pid: None,
+            provider,
+        };
+        tracker.attach(info, capture_tx.clone(), shutdown.clone())?;
+    } else {
+        // Auto-discovery mode: start lifecycle watcher in a background thread.
+        let lc_shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name("sandtrace-lifecycle".to_string())
             .spawn(move || {
-                if let Err(e) =
-                    info.provider
-                        .attach_streaming(&thread_sandbox_id, thread_tx, thread_shutdown)
-                {
-                    tracing::error!(
-                        sandbox_id = %thread_sandbox_id,
-                        error = %e,
-                        "capture failed"
-                    );
+                if let Err(e) = provider.watch_lifecycle(lifecycle_tx, lc_shutdown) {
+                    tracing::error!(error = %e, "lifecycle watcher failed");
                 }
             })?;
-        capture_handles.push(handle);
     }
-    // Drop the original sender so the channel closes when all threads finish.
-    drop(tx);
 
     let policy_rules = policy.as_ref().map(|p| p.rules.len()).unwrap_or(0);
-    pretty::print_banner(&sandbox_ids, &provider_name, policy_rules, &output);
+
+    // Wait briefly for initial discovery before printing banner.
+    if !single_mode {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Process initial lifecycle events.
+        while let Ok(event) = lifecycle_rx.try_recv() {
+            match event {
+                sandtrace_provider::LifecycleEvent::Attached(info) => {
+                    pretty::print_attach(&info.sandbox_id);
+                    if let Err(e) = tracker.attach(info, capture_tx.clone(), shutdown.clone()) {
+                        tracing::warn!(error = %e, "failed to attach");
+                    }
+                }
+                sandtrace_provider::LifecycleEvent::Detached { sandbox_id } => {
+                    pretty::print_detach(&sandbox_id);
+                    tracker.remove(&sandbox_id);
+                }
+            }
+        }
+    }
+
+    pretty::print_banner(&tracker.active_ids(), &provider_name, policy_rules, &output);
 
     let mut stats = pretty::WatchStats::default();
+    let mut seq: u64 = 1;
+    let mut prev_hash: Option<String> = None;
 
-    // Process events as they arrive from all capture threads.
+    // Main event loop: process lifecycle and capture events.
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        // Process lifecycle events (non-blocking).
+        while let Ok(event) = lifecycle_rx.try_recv() {
+            match event {
+                sandtrace_provider::LifecycleEvent::Attached(info) => {
+                    pretty::print_attach(&info.sandbox_id);
+                    if let Err(e) = tracker.attach(info, capture_tx.clone(), shutdown.clone()) {
+                        tracing::warn!(error = %e, "failed to attach to new sandbox");
+                    }
+                }
+                sandtrace_provider::LifecycleEvent::Detached { sandbox_id } => {
+                    pretty::print_detach(&sandbox_id);
+                    tracker.remove(&sandbox_id);
+                }
+            }
+        }
+
+        // Process capture events (with timeout for shutdown checks).
+        match capture_rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(captured) => {
                 let event_type_str = event_type_to_str(&captured.event_type);
                 let evidence_tier = evidence_tier_for(&captured.event_type);
@@ -400,27 +414,108 @@ async fn cmd_watch(
                 stats.record(&audit_event);
                 stream.emit(&audit_event).await?;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!("shutdown signal received, flushing");
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::info!("capture channels closed");
-                break;
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+
+        // Reap finished capture threads (safety net).
+        for id in tracker.reap() {
+            pretty::print_detach(&id);
+        }
+
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("shutdown signal received, flushing");
+            break;
         }
     }
 
-    for handle in capture_handles {
-        let _ = handle.join();
-    }
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    tracker.join_all();
+
     stream.flush().await?;
     stream.close().await?;
 
     pretty::print_summary(&stats, &output);
     Ok(())
+}
+
+/// Manages active capture threads for discovered sandboxes.
+struct SandboxTracker {
+    active: HashMap<String, std::thread::JoinHandle<()>>,
+}
+
+impl SandboxTracker {
+    fn new() -> Self {
+        Self {
+            active: HashMap::new(),
+        }
+    }
+
+    /// Spawn a capture thread for a sandbox and track it.
+    fn attach(
+        &mut self,
+        info: sandtrace_provider::SandboxInfo,
+        tx: std::sync::mpsc::Sender<sandtrace_capture::CapturedEvent>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let sandbox_id = info.sandbox_id.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("sandtrace-{}", sandbox_id))
+            .spawn(move || {
+                if let Err(e) =
+                    info.provider
+                        .attach_streaming(&info.sandbox_id, tx, shutdown)
+                {
+                    tracing::error!(
+                        sandbox_id = %info.sandbox_id,
+                        error = %e,
+                        "capture failed"
+                    );
+                }
+            })?;
+        self.active.insert(sandbox_id, handle);
+        Ok(())
+    }
+
+    /// Check for finished threads and remove them. Returns detached sandbox IDs.
+    fn reap(&mut self) -> Vec<String> {
+        let finished: Vec<String> = self
+            .active
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &finished {
+            if let Some(handle) = self.active.remove(id) {
+                let _ = handle.join();
+                tracing::info!(sandbox_id = %id, "sandbox capture thread finished");
+            }
+        }
+
+        finished
+    }
+
+    /// Remove a sandbox and join its thread.
+    fn remove(&mut self, sandbox_id: &str) {
+        if let Some(handle) = self.active.remove(sandbox_id) {
+            let _ = handle.join();
+        }
+    }
+
+    /// Get sorted list of active sandbox IDs.
+    fn active_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.active.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Wait for all threads to finish.
+    fn join_all(&mut self) {
+        for (_, handle) in self.active.drain() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Map `EventType` enum to its snake_case string representation.

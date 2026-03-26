@@ -94,6 +94,20 @@ pub fn print_banner(sandbox_ids: &[String], provider: &str, policy_rules: usize,
     eprintln!();
 }
 
+/// Print a sandbox attach notification.
+pub fn print_attach(sandbox_id: &str) {
+    eprintln!(
+        "  \x1b[32m+\x1b[0m  attached to \x1b[36m{sandbox_id}\x1b[0m"
+    );
+}
+
+/// Print a sandbox detach notification.
+pub fn print_detach(sandbox_id: &str) {
+    eprintln!(
+        "  \x1b[31m-\x1b[0m  detached from \x1b[36m{sandbox_id}\x1b[0m"
+    );
+}
+
 /// Print a single event in human-readable format.
 pub fn print_event(event: &AuditEvent, multi: bool) {
     let time = &event.wall_time[11..19]; // HH:MM:SS from ISO timestamp

@@ -191,6 +191,7 @@ pub fn discover_daytona_workspaces(workspaces_dir: &str) -> Result<Vec<crate::Sa
 
         sandboxes.push(crate::SandboxInfo {
             sandbox_id: workspace_id.clone(),
+            pid: None,
             provider: Box::new(DaytonaProvider {
                 workspaces_dir: workspaces_dir.to_string(),
                 ..Default::default()

@@ -185,6 +185,7 @@ pub fn discover_e2b_sandboxes(sandboxes_dir: &str) -> Result<Vec<crate::SandboxI
 
         sandboxes.push(crate::SandboxInfo {
             sandbox_id: sandbox_id.clone(),
+            pid: None,
             provider: Box::new(E2bProvider {
                 sandboxes_dir: sandboxes_dir.to_string(),
                 ..Default::default()

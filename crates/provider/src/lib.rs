@@ -18,17 +18,16 @@ pub mod e2b;
 pub mod firecracker;
 pub mod snapshot;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
+
 use anyhow::Result;
 use sandtrace_capture::{CaptureStream, CapturedEvent};
 
 /// Trait for sandbox provider adapters.
 pub trait SandboxProvider: Send {
     /// Attach to a running sandbox and return a continuous stream of events.
-    ///
-    /// Spawns background capture threads (network, filesystem, syscall) that
-    /// feed events into the returned [`CaptureStream`]. The stream remains
-    /// open until the provider's capture threads finish or the shutdown flag
-    /// is set.
     fn attach(&self, sandbox_id: &str) -> Result<CaptureStream>;
 
     /// Attach to a running sandbox and stream events continuously through a channel.
@@ -36,15 +35,13 @@ pub trait SandboxProvider: Send {
     fn attach_streaming(
         &self,
         sandbox_id: &str,
-        tx: std::sync::mpsc::Sender<CapturedEvent>,
-        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tx: mpsc::Sender<CapturedEvent>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<()> {
-        // Default: fall back to CaptureStream-based capture, draining events
-        // via recv_timeout until shutdown or the stream is exhausted.
         let stream = self.attach(sandbox_id)?;
-        let timeout = std::time::Duration::from_secs(1);
+        let timeout = Duration::from_secs(1);
         loop {
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if shutdown.load(Ordering::Relaxed) {
                 break;
             }
             match stream.recv_timeout(timeout) {
@@ -60,12 +57,31 @@ pub trait SandboxProvider: Send {
     }
 
     /// Discover all running sandboxes managed by this provider.
-    ///
-    /// Returns one [`SandboxInfo`] per running VM/sandbox, each with its own
-    /// configured provider instance ready to attach. Providers that don't
-    /// support discovery return an empty list.
     fn discover(&self) -> Result<Vec<SandboxInfo>> {
         Ok(vec![])
+    }
+
+    /// Watch for VM lifecycle events (attach/detach) and emit them through the channel.
+    ///
+    /// The default implementation does a one-time `discover()` and then blocks
+    /// until shutdown. Providers should override this with event-driven
+    /// detection (inotify + pidfd on Linux).
+    fn watch_lifecycle(
+        &self,
+        tx: mpsc::Sender<LifecycleEvent>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<()> {
+        // One-time discovery.
+        for info in self.discover()? {
+            if tx.send(LifecycleEvent::Attached(info)).is_err() {
+                return Ok(());
+            }
+        }
+        // Block until shutdown.
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Ok(())
     }
 
     /// Provider name for logging and identification.
@@ -74,8 +90,18 @@ pub trait SandboxProvider: Send {
 
 /// Information about a discovered running sandbox.
 pub struct SandboxInfo {
-    /// Unique identifier for this sandbox (derived from process, socket path, dir name, etc.).
+    /// Unique identifier for this sandbox.
     pub sandbox_id: String,
     /// Provider adapter configured for this specific sandbox.
     pub provider: Box<dyn SandboxProvider>,
+    /// PID of the VM process (if known). Used for lifecycle monitoring via pidfd.
+    pub pid: Option<u32>,
+}
+
+/// VM lifecycle event emitted by the provider's watcher.
+pub enum LifecycleEvent {
+    /// A new sandbox was discovered and is ready to attach.
+    Attached(SandboxInfo),
+    /// A sandbox has stopped and its capture should be cleaned up.
+    Detached { sandbox_id: String },
 }
