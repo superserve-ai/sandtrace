@@ -61,6 +61,12 @@ enum Command {
         /// Firecracker API socket path (overrides provider default)
         #[arg(long)]
         fc_socket: Option<String>,
+
+        /// Allowed network hosts (comma-separated, e.g. "api.stripe.com,api.openai.com")
+        /// Generates an allowlist policy — any egress to unlisted hosts is denied.
+        /// Cannot be used with --policy.
+        #[arg(long)]
+        allow_hosts: Option<String>,
     },
 
     /// Verify a JSONL audit trail for integrity and policy compliance
@@ -144,6 +150,7 @@ async fn main() -> Result<()> {
             tap_device,
             overlay_dir,
             fc_socket,
+            allow_hosts,
         } => {
             // Set env vars so provider detection picks them up
             if let Some(tap) = &tap_device {
@@ -155,6 +162,16 @@ async fn main() -> Result<()> {
             if let Some(sock) = &fc_socket {
                 std::env::set_var("SANDTRACE_FC_SOCKET", sock);
             }
+
+            // Build policy from --allow-hosts or --policy (not both).
+            let policy = match (&allow_hosts, &policy) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("cannot use both --allow-hosts and --policy");
+                }
+                (Some(hosts), None) => Some(build_allow_hosts_policy(hosts)),
+                _ => policy,
+            };
+
             cmd_watch(
                 sandbox_id,
                 output,
@@ -361,6 +378,30 @@ async fn cmd_watch(
 }
 
 /// Map `EventType` enum to its snake_case string representation.
+/// Build a policy from a comma-separated list of allowed hosts.
+/// Each host gets a rule allowing egress on port 443.
+fn build_allow_hosts_policy(hosts: &str) -> sandtrace_policy::PolicyManifest {
+    let rules = hosts
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|host| {
+            sandtrace_policy::PolicyRule::NetworkEgress {
+                id: format!("allow:{host}"),
+                description: None,
+                action: sandtrace_policy::RuleAction::Allow,
+                destinations: vec![sandtrace_policy::Destination {
+                    host: host.to_string(),
+                    port: 443,
+                }],
+                max_bytes_per_call: None,
+            }
+        })
+        .collect();
+
+    sandtrace_policy::PolicyManifest { rules }
+}
+
 fn event_type_to_str(et: &sandtrace_capture::EventType) -> &'static str {
     match et {
         sandtrace_capture::EventType::NetworkEgress => "network_egress",

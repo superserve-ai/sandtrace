@@ -3,8 +3,6 @@
 # Rules are evaluated in first-match order: the first matching rule determines
 # the verdict. This enables deny-before-allow patterns.
 
-mode: enforce
-
 rules:
   # Deny exfiltration to unknown hosts (first-match: deny before allow)
   - id: deny:unknown-egress

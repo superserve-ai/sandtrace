@@ -11,14 +11,6 @@ pub use engine::PolicyEngine;
 // Core enums
 // ---------------------------------------------------------------------------
 
-/// Global policy mode: audit (log-only) or enforce (block violations).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PolicyMode {
-    Audit,
-    Enforce,
-}
-
 /// Rule action: allow or deny matching events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -115,17 +107,7 @@ pub struct Destination {
 /// A policy manifest loaded from a YAML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyManifest {
-    /// Global policy mode. When `None`, defaults to `Enforce`.
-    #[serde(default)]
-    pub mode: Option<PolicyMode>,
     pub rules: Vec<PolicyRule>,
-}
-
-impl PolicyManifest {
-    /// Effective global mode (defaults to `Enforce` when not specified).
-    pub fn effective_mode(&self) -> PolicyMode {
-        self.mode.unwrap_or(PolicyMode::Enforce)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,8 +127,6 @@ pub enum PolicyRule {
         #[serde(default)]
         action: RuleAction,
         #[serde(default)]
-        mode: Option<PolicyMode>,
-        #[serde(default)]
         destinations: Vec<Destination>,
         #[serde(default)]
         max_bytes_per_call: Option<u64>,
@@ -161,8 +141,6 @@ pub enum PolicyRule {
         #[serde(default)]
         action: RuleAction,
         #[serde(default)]
-        mode: Option<PolicyMode>,
-        #[serde(default)]
         access: Option<AccessPreset>,
         #[serde(default)]
         paths: Vec<String>,
@@ -176,8 +154,6 @@ pub enum PolicyRule {
         description: Option<String>,
         #[serde(default)]
         action: RuleAction,
-        #[serde(default)]
-        mode: Option<PolicyMode>,
         /// Field predicates — all must match for the rule to fire.
         #[serde(rename = "match")]
         predicates: BTreeMap<String, FieldPredicate>,
@@ -194,8 +170,6 @@ pub enum PolicyRule {
         description: Option<String>,
         #[serde(default)]
         action: RuleAction,
-        #[serde(default)]
-        mode: Option<PolicyMode>,
         threshold: ThresholdConfig,
     },
 
@@ -207,8 +181,6 @@ pub enum PolicyRule {
         description: Option<String>,
         #[serde(default)]
         action: RuleAction,
-        #[serde(default)]
-        mode: Option<PolicyMode>,
         sequence: SequenceConfig,
     },
 }
@@ -233,17 +205,6 @@ impl PolicyRule {
             | PolicyRule::Match { action, .. }
             | PolicyRule::Threshold { action, .. }
             | PolicyRule::Sequence { action, .. } => *action,
-        }
-    }
-
-    /// Per-rule mode override, if set.
-    pub fn mode(&self) -> Option<PolicyMode> {
-        match self {
-            PolicyRule::NetworkEgress { mode, .. }
-            | PolicyRule::Filesystem { mode, .. }
-            | PolicyRule::Match { mode, .. }
-            | PolicyRule::Threshold { mode, .. }
-            | PolicyRule::Sequence { mode, .. } => *mode,
         }
     }
 
@@ -449,8 +410,6 @@ rules:
 "#;
         let policy = load_policy(yaml).unwrap();
         assert_eq!(policy.rules.len(), 1);
-        assert_eq!(policy.mode, None);
-        assert_eq!(policy.effective_mode(), PolicyMode::Enforce);
 
         match &policy.rules[0] {
             PolicyRule::NetworkEgress {
@@ -489,7 +448,6 @@ rules:
     #[test]
     fn test_full_manifest_evaluates() {
         let yaml = r#"
-mode: enforce
 rules:
   - id: tool:read_file
     type: filesystem
@@ -540,27 +498,6 @@ rules:
     }
 
     #[test]
-    fn test_load_policy_with_mode() {
-        let yaml = r#"
-mode: audit
-rules:
-  - id: tool:stripe
-    type: network_egress
-    action: allow
-    mode: enforce
-    destinations:
-      - host: api.stripe.com
-        port: 443
-"#;
-        let policy = load_policy(yaml).unwrap();
-        assert_eq!(policy.mode, Some(PolicyMode::Audit));
-        assert_eq!(policy.effective_mode(), PolicyMode::Audit);
-
-        let rule = &policy.rules[0];
-        assert_eq!(rule.action(), RuleAction::Allow);
-        assert_eq!(rule.mode(), Some(PolicyMode::Enforce));
-    }
-
     #[test]
     fn test_parse_match_rule() {
         let yaml = r#"
@@ -825,7 +762,6 @@ rules:
     fn test_parse_deny_before_allow() {
         // First-match order: deny rule comes first
         let yaml = r#"
-mode: enforce
 rules:
   - id: deny:evil
     type: match
@@ -850,7 +786,6 @@ rules:
     fn test_parse_mixed_rule_types() {
         // Manifest with all five rule types
         let yaml = r#"
-mode: audit
 rules:
   - id: tool:stripe
     type: network_egress
@@ -909,7 +844,6 @@ rules:
     type: match
     action: deny
     description: "Test match rule"
-    mode: audit
     match:
       event_type:
         equals: network_egress
@@ -918,7 +852,6 @@ rules:
         let rule = &policy.rules[0];
         assert_eq!(rule.id(), "test-rule");
         assert_eq!(rule.action(), RuleAction::Deny);
-        assert_eq!(rule.mode(), Some(PolicyMode::Audit));
         assert_eq!(rule.description(), Some("Test match rule"));
     }
 
@@ -929,7 +862,6 @@ rules:
     #[test]
     fn test_no_rules_allows_everything() {
         let policy = PolicyManifest {
-            mode: None,
             rules: vec![],
         };
         let event = make_event(
@@ -1186,7 +1118,6 @@ rules:
     #[test]
     fn test_unknown_event_type_allows() {
         let policy = PolicyManifest {
-            mode: None,
             rules: vec![],
         };
         let event = make_event("custom_metric", serde_json::json!({}));
@@ -1239,7 +1170,6 @@ rules:
     #[test]
     fn test_serialization_produces_valid_yaml() {
         let yaml = r#"
-mode: audit
 rules:
   - id: tool:stripe
     type: network_egress
@@ -1258,7 +1188,6 @@ rules:
         // with externally-tagged enums inside internally-tagged enums prevents
         // full round-trip for match/threshold/sequence rules)
         let reparsed = load_policy(&serialized).unwrap();
-        assert_eq!(reparsed.mode, Some(PolicyMode::Audit));
         assert_eq!(reparsed.rules.len(), 1);
         assert!(matches!(reparsed.rules[0], PolicyRule::NetworkEgress { .. }));
     }
