@@ -325,7 +325,7 @@ async fn cmd_watch(
                 let verdict = if let Some(ref mut eng) = engine {
                     let tmp = sandtrace_audit_chain::build_event(
                         event_type_str,
-                        &captured.agent_id,
+                        &captured.sandbox_id,
                         &captured.trace_id,
                         seq,
                         prev_hash.clone(),
@@ -338,7 +338,7 @@ async fn cmd_watch(
                     policy.as_ref().map(|p| {
                         let tmp = sandtrace_audit_chain::build_event(
                             event_type_str,
-                            &captured.agent_id,
+                            &captured.sandbox_id,
                             &captured.trace_id,
                             seq,
                             prev_hash.clone(),
@@ -352,7 +352,7 @@ async fn cmd_watch(
 
                 let audit_event = sandtrace_audit_chain::build_event(
                     event_type_str,
-                    &captured.agent_id,
+                    &captured.sandbox_id,
                     &captured.trace_id,
                     seq,
                     prev_hash.clone(),

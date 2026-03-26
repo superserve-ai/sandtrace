@@ -103,7 +103,7 @@ impl SandboxProvider for E2bProvider {
 
         // Filesystem monitoring thread.
         let fs_config = FsTrackingConfig {
-            agent_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
             method: FsTrackingMethod::SnapshotDiff {
                 before: before_dir,
@@ -119,7 +119,7 @@ impl SandboxProvider for E2bProvider {
         if let Some(tap) = &self.tap_device {
             let net_config = NetworkCaptureConfig {
                 tap_device: tap.clone(),
-                agent_id: sandbox_id.to_string(),
+                sandbox_id: sandbox_id.to_string(),
                 trace_id: trace_id.clone(),
                 ..Default::default()
             };
@@ -133,7 +133,7 @@ impl SandboxProvider for E2bProvider {
         if let Some(pid) = self.jailer_pid {
             let sc_config = SyscallMonitorConfig {
                 jailer_pid: pid,
-                agent_id: sandbox_id.to_string(),
+                sandbox_id: sandbox_id.to_string(),
                 trace_id,
                 ..Default::default()
             };

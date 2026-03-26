@@ -52,7 +52,7 @@ fn parse_wall_time(s: &str) -> Option<DateTime<Utc>> {
 fn extract_field<'a>(event: &'a AuditEvent, field: &str) -> Option<serde_json::Value> {
     match field {
         "event_type" => Some(serde_json::Value::String(event.event_type.clone())),
-        "agent_id" => Some(serde_json::Value::String(event.agent_id.clone())),
+        "sandbox_id" => Some(serde_json::Value::String(event.sandbox_id.clone())),
         "trace_id" => Some(serde_json::Value::String(event.trace_id.clone())),
         "event_id" => Some(serde_json::Value::String(event.event_id.clone())),
         "evidence_tier" => Some(serde_json::Value::String(event.evidence_tier.clone())),
@@ -769,7 +769,7 @@ mod tests {
             schema_version: "2.0".into(),
             event_id: "e1".into(),
             event_type: event_type.into(),
-            agent_id: "a1".into(),
+            sandbox_id: "a1".into(),
             trace_id: "t1".into(),
             seq: 1,
             prev_hash: None,

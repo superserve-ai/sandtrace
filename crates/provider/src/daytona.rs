@@ -112,7 +112,7 @@ impl SandboxProvider for DaytonaProvider {
 
         // Filesystem monitoring thread.
         let fs_config = FsTrackingConfig {
-            agent_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
             method,
         };
@@ -125,7 +125,7 @@ impl SandboxProvider for DaytonaProvider {
         if let Some(tap) = &self.tap_device {
             let net_config = NetworkCaptureConfig {
                 tap_device: tap.clone(),
-                agent_id: sandbox_id.to_string(),
+                sandbox_id: sandbox_id.to_string(),
                 trace_id: trace_id.clone(),
                 ..Default::default()
             };
@@ -139,7 +139,7 @@ impl SandboxProvider for DaytonaProvider {
         if let Some(pid) = self.jailer_pid {
             let sc_config = SyscallMonitorConfig {
                 jailer_pid: pid,
-                agent_id: sandbox_id.to_string(),
+                sandbox_id: sandbox_id.to_string(),
                 trace_id,
                 ..Default::default()
             };

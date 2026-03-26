@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub struct CapturedEvent {
     pub event_id: String,
     pub event_type: EventType,
-    pub agent_id: String,
+    pub sandbox_id: String,
     pub trace_id: String,
     pub wall_time: DateTime<Utc>,
     pub payload: serde_json::Value,
@@ -34,14 +34,14 @@ pub enum EventType {
 impl CapturedEvent {
     pub fn new(
         event_type: EventType,
-        agent_id: &str,
+        sandbox_id: &str,
         trace_id: &str,
         payload: serde_json::Value,
     ) -> Self {
         Self {
             event_id: Uuid::new_v4().to_string(),
             event_type,
-            agent_id: agent_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
             trace_id: trace_id.to_string(),
             wall_time: Utc::now(),
             payload,

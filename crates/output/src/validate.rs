@@ -13,8 +13,8 @@ pub enum ValidationError {
     #[error("event_type \"{0}\" is not in schema enum [network_egress, policy_violation, filesystem_summary]")]
     InvalidEventType(String),
 
-    #[error("agent_id must not be empty")]
-    EmptyAgentId,
+    #[error("sandbox_id must not be empty")]
+    EmptySandboxId,
 
     #[error("trace_id must not be empty")]
     EmptyTraceId,
@@ -55,8 +55,8 @@ pub fn validate_event(event: &AuditEvent) -> Result<()> {
         return Err(ValidationError::InvalidEventType(event.event_type.clone()).into());
     }
 
-    if event.agent_id.is_empty() {
-        return Err(ValidationError::EmptyAgentId.into());
+    if event.sandbox_id.is_empty() {
+        return Err(ValidationError::EmptySandboxId.into());
     }
 
     if event.trace_id.is_empty() {

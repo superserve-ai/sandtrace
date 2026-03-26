@@ -57,7 +57,7 @@ impl SandboxProvider for FirecrackerProvider {
 
         // Filesystem monitoring thread — periodic overlay re-scan.
         let fs_config = FsTrackingConfig {
-            agent_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
             method: FsTrackingMethod::OverlayUpperDir {
                 upper_dir: PathBuf::from(&self.overlay_upper_dir),
@@ -71,7 +71,7 @@ impl SandboxProvider for FirecrackerProvider {
         // Network capture thread — continuous AF_PACKET sniffing.
         let net_config = NetworkCaptureConfig {
             tap_device: self.tap_device.clone(),
-            agent_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
             trace_id: trace_id.clone(),
             ..Default::default()
         };
@@ -84,7 +84,7 @@ impl SandboxProvider for FirecrackerProvider {
         if let Some(pid) = self.jailer_pid {
             let sc_config = SyscallMonitorConfig {
                 jailer_pid: pid,
-                agent_id: sandbox_id.to_string(),
+                sandbox_id: sandbox_id.to_string(),
                 trace_id,
                 ..Default::default()
             };
@@ -112,7 +112,7 @@ impl SandboxProvider for FirecrackerProvider {
         shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         let trace_id = uuid::Uuid::new_v4().to_string();
-        let agent_id = sandbox_id.to_string();
+        let sandbox_id = sandbox_id.to_string();
 
         tracing::info!(sandbox_id, "starting continuous capture");
 
@@ -120,7 +120,7 @@ impl SandboxProvider for FirecrackerProvider {
         let net_tx = tx.clone();
         let net_shutdown = shutdown.clone();
         let tap_device = self.tap_device.clone();
-        let net_agent_id = agent_id.clone();
+        let net_sandbox_id = sandbox_id.clone();
         let net_trace_id = trace_id.clone();
 
         let net_handle = std::thread::Builder::new()
@@ -128,7 +128,7 @@ impl SandboxProvider for FirecrackerProvider {
             .spawn(move || {
                 let config = NetworkCaptureConfig {
                     tap_device,
-                    agent_id: net_agent_id,
+                    sandbox_id: net_sandbox_id,
                     trace_id: net_trace_id,
                     ..Default::default()
                 };
@@ -146,14 +146,14 @@ impl SandboxProvider for FirecrackerProvider {
         let fs_tx = tx.clone();
         let fs_shutdown = shutdown.clone();
         let overlay_upper_dir = self.overlay_upper_dir.clone();
-        let fs_agent_id = agent_id.clone();
+        let fs_sandbox_id = sandbox_id.clone();
         let fs_trace_id = trace_id.clone();
 
         let fs_handle = std::thread::Builder::new()
             .name("sandtrace-fs".to_string())
             .spawn(move || {
                 let config = FsTrackingConfig {
-                    agent_id: fs_agent_id,
+                    sandbox_id: fs_sandbox_id,
                     trace_id: fs_trace_id,
                     method: FsTrackingMethod::OverlayUpperDir {
                         upper_dir: std::path::PathBuf::from(overlay_upper_dir),

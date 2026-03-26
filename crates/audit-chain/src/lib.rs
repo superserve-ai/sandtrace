@@ -10,7 +10,7 @@ pub struct AuditEvent {
     pub schema_version: String,
     pub event_id: String,
     pub event_type: String,
-    pub agent_id: String,
+    pub sandbox_id: String,
     pub trace_id: String,
     pub seq: u64,
     pub prev_hash: Option<String>,
@@ -206,7 +206,7 @@ pub fn verify_chain(events: &[AuditEvent]) -> Result<ChainVerification> {
 
 /// Compute the hash for a single audit event record.
 ///
-/// The hash covers: event_id, event_type, agent_id, trace_id, seq,
+/// The hash covers: event_id, event_type, sandbox_id, trace_id, seq,
 /// prev_hash, wall_time, evidence_tier, and the canonical JSON payload.
 ///
 /// Each variable-length field is length-prefixed (8-byte little-endian length)
@@ -226,7 +226,7 @@ pub fn compute_record_hash(event: &AuditEvent) -> String {
 
     hash_str(&mut hasher, &event.event_id);
     hash_str(&mut hasher, &event.event_type);
-    hash_str(&mut hasher, &event.agent_id);
+    hash_str(&mut hasher, &event.sandbox_id);
     hash_str(&mut hasher, &event.trace_id);
     hasher.update(event.seq.to_le_bytes());
     hash_str(
@@ -273,7 +273,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 /// Build a new audit event and chain it to the previous hash.
 pub fn build_event(
     event_type: &str,
-    agent_id: &str,
+    sandbox_id: &str,
     trace_id: &str,
     seq: u64,
     prev_hash: Option<String>,
@@ -288,7 +288,7 @@ pub fn build_event(
         schema_version: "1.0".to_string(),
         event_id,
         event_type: event_type.to_string(),
-        agent_id: agent_id.to_string(),
+        sandbox_id: sandbox_id.to_string(),
         trace_id: trace_id.to_string(),
         seq,
         prev_hash,
@@ -349,7 +349,7 @@ impl AuditChain {
     pub fn append(
         &mut self,
         event_type: &str,
-        agent_id: &str,
+        sandbox_id: &str,
         trace_id: &str,
         evidence_tier: &str,
         payload: serde_json::Value,
@@ -357,7 +357,7 @@ impl AuditChain {
     ) -> Result<AuditEvent> {
         let event = build_event(
             event_type,
-            agent_id,
+            sandbox_id,
             trace_id,
             self.next_seq,
             self.prev_hash.clone(),
@@ -716,7 +716,7 @@ mod tests {
             schema_version: "1.0".into(),
             event_id: "fixed-id".into(),
             event_type: "network_egress".into(),
-            agent_id: "agent-1".into(),
+            sandbox_id: "agent-1".into(),
             trace_id: "trace-1".into(),
             seq: 1,
             prev_hash: None,
@@ -741,7 +741,7 @@ mod tests {
             schema_version: "1.0".into(),
             event_id: "ab".into(),
             event_type: "cd".into(),
-            agent_id: "agent-1".into(),
+            sandbox_id: "agent-1".into(),
             trace_id: "trace-1".into(),
             seq: 1,
             prev_hash: None,
@@ -768,7 +768,7 @@ mod tests {
             schema_version: "1.0".into(),
             event_id: "id-1".into(),
             event_type: "network_egress".into(),
-            agent_id: "agent-1".into(),
+            sandbox_id: "agent-1".into(),
             trace_id: "trace-1".into(),
             seq: 1,
             prev_hash: None,
